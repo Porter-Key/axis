@@ -61,10 +61,12 @@ func New(cfg *config.Config) (*App, error) {
 	// 子插件: LSP / codegraph / memory
 	lspPlugin := lsp.New(cfg)
 	cgPlugin := codegraph.NewPlugin(cfg.Codegraph)
+	cgPlugin.SetOutputFormat(cfg.Output.Format) // codegraph GCF 适配器开关 (LSP 经整 cfg 热读)
 	memPlugin, err := newMemoryPlugin(cfg)
 	if err != nil {
 		return nil, err
 	}
+	memPlugin.SetOutputFormat(cfg.Output.Format) // memory GCF 适配器开关
 
 	a.lsp = lspPlugin
 	a.cg = cgPlugin

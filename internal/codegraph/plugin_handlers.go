@@ -84,7 +84,9 @@ func (p *Plugin) handleJSON(kind string) server.ToolHandlerFunc {
 		if err != nil {
 			return mcpkit.ErrRes(err.Error()), nil
 		}
-		return mcpkit.OkJSON(res), nil
+		tool := map[string]string{"query": "query_symbols", "callers": "find_callers", "callees": "find_callees", "impact": "analyze_impact", "status": "index_status"}[kind]
+		sym, _ := args["symbol"].(string)
+		return p.okJSON(tool, kind, sym, res), nil
 	}
 }
 

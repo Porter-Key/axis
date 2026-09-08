@@ -45,7 +45,7 @@ func (p *Plugin) handleUpdate(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
-	return mcpkit.OkJSON(res), nil
+	return p.okJSON("mem_update", res), nil
 }
 
 func (p *Plugin) handleRetrieve(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -59,7 +59,7 @@ func (p *Plugin) handleRetrieve(ctx context.Context, req mcp.CallToolRequest) (*
 	if err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
-	return mcpkit.OkJSON(v), nil
+	return p.okJSON("mem_retrieve", v), nil
 }
 
 func (p *Plugin) handleFind(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -74,7 +74,7 @@ func (p *Plugin) handleFind(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
-	return mcpkit.OkJSON(hits), nil
+	return p.okJSON("mem_find", hits), nil
 }
 
 func (p *Plugin) handleList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -86,7 +86,7 @@ func (p *Plugin) handleList(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
-	return mcpkit.OkJSON(keys), nil
+	return p.okJSON("mem_list", keys), nil
 }
 
 func (p *Plugin) handleField(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -101,7 +101,7 @@ func (p *Plugin) handleField(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	if err := svc.Field(key, name, value); err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
-	return mcpkit.OkJSON(map[string]any{"ok": true, "key": key, "field": name, "value": value}), nil
+	return p.okJSON("mem_field", map[string]any{"ok": true, "key": key, "field": name, "value": value}), nil
 }
 
 func (p *Plugin) handleLink(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -117,7 +117,7 @@ func (p *Plugin) handleLink(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if err := svc.Link(src, dst, typ, label); err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
-	return mcpkit.OkJSON(map[string]any{"ok": true, "src": src, "dst": dst, "type": typ}), nil
+	return p.okJSON("mem_link", map[string]any{"ok": true, "src": src, "dst": dst, "type": typ}), nil
 }
 
 func (p *Plugin) handleExport(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -132,12 +132,12 @@ func (p *Plugin) handleExport(ctx context.Context, req mcp.CallToolRequest) (*mc
 		if err != nil {
 			return mcpkit.ErrRes(err.Error()), nil
 		}
-		return mcpkit.OkJSON(map[string]any{"ok": true, "exported": n}), nil
+		return p.okJSON("mem_export", map[string]any{"ok": true, "exported": n}), nil
 	}
 	if err := svc.ExportDoc(key); err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
-	return mcpkit.OkJSON(map[string]any{"ok": true, "exported": 1, "key": key, "path": svc.ExportPath(key)}), nil
+	return p.okJSON("mem_export", map[string]any{"ok": true, "exported": 1, "key": key, "path": svc.ExportPath(key)}), nil
 }
 
 func (p *Plugin) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -149,9 +149,9 @@ func (p *Plugin) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mc
 	}
 	v, err := svc.Retrieve(key)
 	if err != nil {
-		return mcpkit.OkJSON(map[string]any{"key": key, "exists": false}), nil
+		return p.okJSON("mem_status", map[string]any{"key": key, "exists": false}), nil
 	}
-	return mcpkit.OkJSON(map[string]any{
+	return p.okJSON("mem_status", map[string]any{
 		"key": key, "exists": true,
 		"revision": v.Revision, "title": v.Title,
 		"updated_at":  v.UpdatedAt,

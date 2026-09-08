@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -36,6 +37,9 @@ type Plugin struct {
 	baseDir   string // 库根目录 (~/.local/state/axis/memory 或 config.Memory.DBPath 的目录)
 	exportDir string
 	ext       string
+
+	// outFormat 输出编码 (""/json/gcf, atomic.Value 存 string, 本插件 GCF 适配器开关)。
+	outFormat atomic.Value
 
 	mu   sync.Mutex
 	svcs map[string]*svcEntry // 库 key (project 根/global) → 条目
@@ -171,6 +175,7 @@ func (p *Plugin) Shutdown(ctx context.Context) error {
 // ---------- 工具注册 ----------
 
 // Register 注册 memory 工具组。
+// 输出契约: 配置 output.format=gcf 时输出 GCF generic 画像 (失败回退原 JSON)。
 func (p *Plugin) Register(ms *server.MCPServer) {
 	ms.AddTool(mcp.NewTool("mem_update",
 		mcp.WithDescription("整篇正文入库 (唯一正文写路径)。作用于当前激活项目; 显式 project=global 写全局。解析+校验; frontmatter 与 DB 不符→warning+忽略结构化字段; 正文 diff 统计 + 链接意图提示 (不自动连线)。"),

@@ -176,7 +176,7 @@ axis_activate(project=/abs/path/to/your/project)
 That's it. Detailed setup (systemd, session lifecycle, memory workflow):
 [`docs/setup.zh.md`](docs/setup.zh.md).
 
-## MCP tools (22)
+## MCP tools (26)
 
 | Tool | Plugin | Purpose |
 |---|---|---|
@@ -187,6 +187,10 @@ That's it. Detailed setup (systemd, session lifecycle, memory workflow):
 | `get_rename` | LSP | Rename impact surface |
 | `get_symbols` | LSP | File / workspace symbols |
 | `get_diagnostics` | LSP | Compiler errors & warnings |
+| `blast_radius` | LSP | Smart workflow: definition+signature, all references (test/non-test), diagnostics |
+| `explore_symbol` | LSP | Smart workflow: hover signature + definition + references in one pass |
+| `verify_chain` | LSP | Smart workflow: post-edit verification (diagnostics + build/test hints) |
+| `simulate_edit` | LSP | Smart workflow: in-memory edit preview → diagnostic diff (no disk write) |
 | `explore_code` | codegraph | Task → relevant symbols + call paths |
 | `query_symbols` | codegraph | Fuzzy symbol search (JSON) |
 | `find_callers` / `find_callees` | codegraph | Call graph directions |
@@ -202,6 +206,13 @@ That's it. Detailed setup (systemd, session lifecycle, memory workflow):
 All LSP tools take absolute `path` (+ `line`/`character`). Language is
 detected from the file extension; the project root is found by walking up to
 a marker file (go.mod, Cargo.toml, ...).
+
+### Output encoding (`output.format`)
+
+Default `json` (byte-identical). Set `output.format: gcf` for GCF compact
+images — each plugin adapts internally (LSP/memory → generic, codegraph
+`callers`/`callees`/`impact` → graph); `explore`/`files` stay text. Encoding
+failures silently fall back to JSON. Hot-reload applies immediately.
 
 ## HTTP control plane (`/ctrl/`)
 

@@ -59,6 +59,9 @@ type Conn struct {
 
 	// openDocs uri -> 已同步内容 sha256 前缀 (长连接: didOpen 后保持; 变更则 didChange)。
 	openDocs map[string]string
+	// preview uri -> true 表示该文档滞留合成预览内容 (simulate_edit 未恢复);
+	// 置位期间任何文件请求强制重同步磁盘内容 (防服务器用合成内容答题)。
+	preview map[string]bool
 	// docVersion uri -> 当前版本号 (didChange/didOpen 递增, LSP 要求单调)。
 	docVersion map[string]int
 	// dirtyAll true = 项目级失效 (fsmonitor 报告目录变更但未知具体文件), 下次任一文件请求前重读。
@@ -211,7 +214,7 @@ func (c *Conn) CallWithDoc(ctx context.Context, method string, filePath string, 
 	hash := fileHash(text)
 
 	prevHash, opened := c.openDocs[uri]
-	needSync := !opened || c.dirtyAll || prevHash != hash
+	needSync := !opened || c.dirtyAll || c.preview[uri] || prevHash != hash
 	if c.dirtyAll {
 		c.dirtyAll = false
 	}
@@ -231,6 +234,7 @@ func (c *Conn) CallWithDoc(ctx context.Context, method string, filePath string, 
 			return nil, err
 		}
 		c.openDocs[uri] = hash
+		delete(c.preview, uri) // 磁盘内容已同步, 预览滞留解除
 	} else if needSync {
 		// 已开但磁盘变更: didChange (full text, range 为空 = 全量)
 		didChange := map[string]any{
@@ -247,6 +251,7 @@ func (c *Conn) CallWithDoc(ctx context.Context, method string, filePath string, 
 			return nil, err
 		}
 		c.openDocs[uri] = hash
+		delete(c.preview, uri) // 磁盘内容已同步, 预览滞留解除
 	}
 	c.mu.Unlock() // 文档状态已定; 下方网络往返不再持锁 (多路并发)
 
@@ -312,10 +317,40 @@ func (c *Conn) SyncFile(ctx context.Context, filePath string) error {
 	}
 	c.openDocs[uri] = hash
 	c.dirtyAll = false
+	delete(c.preview, uri) // 磁盘内容已同步 (RestoreFile 语义), 预览滞留解除
 	return nil
 }
 
-// NeedsSync 该文件是否需同步 (磁盘 hash 与已同步不一致, 或项目级失效未清)。
+// PreviewText 发送合成 didChange (不落盘), 供 simulate_edit 预览用。
+// 置 preview 标记: 后续任何文件请求强制重同步磁盘内容 (防合成内容污染答题);
+// 调用方必须随后 RestoreFile (SyncFile 即恢复, 顺带清标记)。
+func (c *Conn) PreviewText(filePath, text string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastUse = time.Now()
+
+	uri := uriFromPath(filePath)
+	if _, opened := c.openDocs[uri]; !opened {
+		return fmt.Errorf("PreviewText 要求文档已打开 (先经 CallWithDoc 触发 didOpen): %s", filePath)
+	}
+	didChange := map[string]any{
+		"textDocument": map[string]any{"uri": uri, "version": c.nextVersion(uri)},
+		"contentChanges": []map[string]any{
+			{"text": text},
+		},
+	}
+	if err := c.writeMsg(method_notify, "textDocument/didChange", didChange); err != nil {
+		return err
+	}
+	if c.preview == nil {
+		c.preview = map[string]bool{}
+	}
+	c.preview[uri] = true
+	return nil
+}
+
+// NeedsSync 该文件是否需同步 (磁盘 hash 与已同步不一致, 或项目级失效未清,
+// 或滞留合成预览内容)。
 func (c *Conn) NeedsSync(filePath string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -323,6 +358,9 @@ func (c *Conn) NeedsSync(filePath string) bool {
 		return true
 	}
 	uri := uriFromPath(filePath)
+	if c.preview[uri] {
+		return true // 滞留合成预览 → 强制重同步
+	}
 	prev, opened := c.openDocs[uri]
 	if !opened {
 		return true

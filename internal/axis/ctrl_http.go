@@ -97,6 +97,8 @@ func (a *App) ctrlReload(w http.ResponseWriter, r *http.Request) {
 	a.cfg.Store(newCfg)
 	a.lsp.SetConfig(newCfg) // 透传 registry (不透传等于没重载)
 	a.cg.SetConfig(newCfg.Codegraph)
+	a.cg.SetOutputFormat(newCfg.Output.Format)  // codegraph GCF 开关热生效
+	a.mem.SetOutputFormat(newCfg.Output.Format) // memory GCF 开关热生效
 	a.writeJSON(w, 200, map[string]any{"ok": true, "adapters": langsList(newCfg),
 		"config": config.ResolvePath(a.cfgPath), "note": "memory 库目录变更需重启生效"})
 }

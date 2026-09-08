@@ -104,6 +104,12 @@ memory:
   # export_dir: /var/lib/axis/memory      # md export base
   # extension: md
 
+# Output encoding (per-plugin GCF adapters read this switch; hot-reload applies).
+# json = original JSON (default, byte-identical); gcf = GCF compact images
+# (LSP/memory → generic, codegraph callers/callees/impact → graph).
+output:
+  format: json
+
 # Structured JSONL logging
 log:
   # path: /var/log/axis/server.jsonl

@@ -54,3 +54,30 @@ func TestLoad_OverridesAdapterAndAddsNew(t *testing.T) {
 		t.Errorf("go should keep default: %+v", cfg.Adapters["go"])
 	}
 }
+
+func TestLoad_OutputFormat(t *testing.T) {
+	// 默认 json
+	cfg, err := Load(filepath.Join(t.TempDir(), "nonexist.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Output.Format != "json" {
+		t.Errorf("default output.format=%q, want json", cfg.Output.Format)
+	}
+	// gcf 生效, 非法值回 json
+	for in, want := range map[string]string{"gcf": "gcf", "xml": "json", "": "json"} {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "c.yaml")
+		b, _ := yaml.Marshal(map[string]any{"output": map[string]any{"format": in}})
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Output.Format != want {
+			t.Errorf("output.format=%q → %q, want %q", in, cfg.Output.Format, want)
+		}
+	}
+}

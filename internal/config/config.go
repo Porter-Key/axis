@@ -37,6 +37,11 @@ type PoolConfig struct {
 	MemoryLimitMB int `json:"memory_limit_mb,omitempty" yaml:"memory_limit_mb,omitempty"`
 }
 
+// OutputConfig 输出编码配置 (各插件的 GCF 适配器各自读取本开关)。
+type OutputConfig struct {
+	Format string `json:"format,omitempty" yaml:"format,omitempty"` // json | gcf (默认 json)
+}
+
 // Config 顶层配置。
 type Config struct {
 	Adapters  map[string]LangAdapter `json:"adapters" yaml:"adapters"` // key = language_id
@@ -44,6 +49,7 @@ type Config struct {
 	Pool      PoolConfig             `json:"pool" yaml:"pool"`
 	Codegraph CodegraphConfig        `json:"codegraph" yaml:"codegraph"`
 	Memory    MemoryConfig           `json:"memory,omitempty" yaml:"memory,omitempty"` // memory 子模块 (sqlite=SSOT 知识库)
+	Output    OutputConfig           `json:"output,omitempty" yaml:"output,omitempty"` // 输出编码 (各插件 GCF 适配器开关)
 	Ignore    []string               `json:"ignore,omitempty" yaml:"ignore,omitempty"` // 项目级忽略 (目录/文件名片段, fsmonitor 与 codegraph 通用)
 	Log       LogConfig              `json:"log,omitempty" yaml:"log,omitempty"`       // 结构化日志 (JSONL)
 	CtrlToken string                 `json:"ctrl_token,omitempty" yaml:"ctrl_token,omitempty"`
@@ -114,6 +120,7 @@ func Default() *Config {
 		Pool:      PoolConfig{IdleTTLSec: 900, MaxServers: 6, MemoryLimitMB: 1024},
 		Codegraph: CodegraphConfig{Bin: "codegraph", AutoInit: false, SyncOnChange: true, TimeoutSec: 120},
 		Memory:    MemoryConfig{},
+		Output:    OutputConfig{Format: "json"},
 		Ignore:    DefaultIgnore,
 	}
 	return cfg
@@ -189,6 +196,13 @@ func Load(path string) (*Config, error) {
 		cfg.Log.Level = fileCfg.Log.Level
 	}
 	cfg.Log.Also = fileCfg.Log.Also
+	// 输出编码: 非法值回默认 json (各插件 GCF 适配器只认 "gcf")。
+	if fileCfg.Output.Format != "" {
+		cfg.Output.Format = fileCfg.Output.Format
+	}
+	if cfg.Output.Format != "gcf" {
+		cfg.Output.Format = "json"
+	}
 	// 数值钳位 (单点真相, 下游 registry/reapLoop 不再各自防御):
 	// MaxServers<1 会让 LRU 逐出取 poolOrder[0] panic; IdleTTLSec/Heartbeat<=0
 	// 会让回收循环把"全部连接/会话"当过期清掉 (接近活锁)。非法值直接回默认。

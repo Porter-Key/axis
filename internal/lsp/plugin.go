@@ -112,6 +112,33 @@ func (l *LSP) Register(ms *server.MCPServer) {
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件或目录绝对路径")),
 		mcp.WithString("query", mcp.Description("符号搜索词 (workspace 模式)")),
 	), l.handleSymbols)
+
+	// 智能 workflow (batch: 一次调用完成多步编排; 各语言适配器在自己文件内自实现;
+	// 配置 output.format=gcf 时输出 GCF generic 画像)。
+	ms.AddTool(mcp.NewTool("blast_radius",
+		mcp.WithDescription("智能 workflow·影响面（批）：定义(+签名)+全部引用（测试/非测试分区）+诊断摘要，一次返回。替代 20+ 次零散 LSP 调用；动手改代码以 get_references 复核。"),
+		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径")),
+		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
+		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
+	), l.handleBlastRadius)
+
+	ms.AddTool(mcp.NewTool("explore_symbol",
+		mcp.WithDescription("智能 workflow·符号理解（批）：hover 签名+定义落点+引用计数/前 N 条，一把梭。先看它再决定跟 definition。"),
+		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径")),
+		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
+		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
+	), l.handleExploreSymbol)
+
+	ms.AddTool(mcp.NewTool("verify_chain",
+		mcp.WithDescription("智能 workflow·修改后验证（批）：文件诊断+构建/测试提示（build/test 由你跑）。每次落盘改代码后调一次。"),
+		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径")),
+	), l.handleVerifyChain)
+
+	ms.AddTool(mcp.NewTool("simulate_edit",
+		mcp.WithDescription("智能 workflow·安全编辑预览（批）：edits 作用于内存合成内容（不落盘）→诊断 diff→自动恢复。只预览不应用；应用由你落盘。"),
+		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径")),
+		mcp.WithArray("edits", mcp.Required(), mcp.Description("编辑数组，每项 {startLine,startChar,endLine,endChar,newText} (0-based 行，列为 UTF-8 字节偏移，相对磁盘内容)")),
+	), l.handleSimulateEdit)
 }
 
 // Start 启动 monitor 消费循环。

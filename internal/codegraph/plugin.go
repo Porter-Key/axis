@@ -19,6 +19,8 @@ type Plugin struct {
 	// cg 热重载可换指针: atomic (handler 并发读, SetConfig 并发写)。
 	cg   atomic.Pointer[Client]
 	gate *plugin.Gate
+	// outFormat 输出编码 (""/json/gcf, atomic.Value 存 string, 本插件 GCF 适配器开关)。
+	outFormat atomic.Value
 }
 
 // New 构建 codegraph 插件。
@@ -42,6 +44,9 @@ func (p *Plugin) SetConfig(cfg config.CodegraphConfig) {
 func (p *Plugin) SetGate(g *plugin.Gate) { p.gate = g }
 
 // Register 注册 codegraph 工具。
+// 输出契约: 配置 output.format=gcf 时, JSON 类工具输出 GCF
+// (callers/callees/impact → graph 画像, query/status → generic 画像),
+// explore/files 保持文本 (源码/文件表不编码)。
 func (p *Plugin) Register(ms *server.MCPServer) {
 	ms.AddTool(mcp.NewTool("explore_code",
 		mcp.WithDescription("陌生代码第一步（粗）：输入任务描述，一次返回相关符号源码+调用路径。精确落点再用 LSP 工具（get_definition/get_references）。"),

@@ -78,7 +78,7 @@ func (l *LSP) handleDefinition(ctx context.Context, req mcp.CallToolRequest) (*m
 	res = l.adaptPositions(lang, path, res)
 	// 签名增强: 跳转落点自动附签名 (definition/implementation/typeDefinition 全覆盖)
 	res = l.attachSignaturesToLocations(ctx, root, res)
-	return mcpkit.OkJSON(res), nil
+	return l.okJSON("get_definition", res), nil
 }
 
 // handleLSPRequest 生成单个位置查询 handler (hover/references 共用)。
@@ -124,7 +124,7 @@ func (l *LSP) handleLSPRequest(lspMethod string) server.ToolHandlerFunc {
 			res = l.adaptPositions(lang, path, res)
 			res = l.attachSignaturesToLocations(ctx, root, res)
 		}
-		return mcpkit.OkJSON(res), nil
+		return l.okJSON("get_"+lspMethod, res), nil
 	}
 }
 
@@ -158,7 +158,7 @@ func (l *LSP) handleDiagnostics(ctx context.Context, req mcp.CallToolRequest) (*
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if raw, ok := l.reg.DiagnosticsFor(root, lang, path); ok {
-			return mcpkit.OkJSON(l.shapeDiagnostics(path, raw, true)), nil
+			return l.okJSON("get_diagnostics", l.shapeDiagnostics(path, raw, true)), nil
 		}
 		if time.Now().After(deadline) {
 			break
@@ -169,7 +169,7 @@ func (l *LSP) handleDiagnostics(ctx context.Context, req mcp.CallToolRequest) (*
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	return mcpkit.OkJSON(l.shapeDiagnostics(path, nil, false)), nil
+	return l.okJSON("get_diagnostics", l.shapeDiagnostics(path, nil, false)), nil
 }
 
 // shapeDiagnostics 包装诊断输出: 明确区分"服务器说没报错"与"尚无推送"(避免 agent 误判零报错)。
@@ -217,7 +217,7 @@ func (l *LSP) handleRename(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	}
 	// 响应列换算: WorkspaceEdit 位置 → 客户端单位 (agent 按此落盘, 错位会改错地方)
 	res = l.adaptPositions(lang, path, res)
-	return mcpkit.OkJSON(res), nil
+	return l.okJSON("get_rename", res), nil
 }
 
 func (l *LSP) handleSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -255,7 +255,7 @@ func (l *LSP) handleSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				}
 				// 响应列换算 (落点自带 uri, srcPath 仅兜底)
 				res = l.adaptPositions(lang, path, res)
-				return mcpkit.OkJSON(res), nil
+				return l.okJSON("get_symbols", res), nil
 			}
 		}
 		return mcpkit.ErrRes("目录模式需已有 LSP 连接 (先用文件模式查询触发)"), nil
@@ -271,7 +271,7 @@ func (l *LSP) handleSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 	// 响应列换算 (同文件符号, 归属查询源文件)
 	res = l.adaptPositions(lang, path, res)
-	return mcpkit.OkJSON(res), nil
+	return l.okJSON("get_symbols", res), nil
 }
 
 // ---------- 项目/监控辅助 ----------

@@ -168,6 +168,7 @@ type ReadLine = positions.ReadLine
 // 实现必须自包含在单个 *_capacity_provider.go: 配置真相/进程适配/DTO 解析/能力判断
 // 全部私有实现于该文件, 不跨文件共享。
 type Provider interface {
+	Workflows // 智能 workflow (各适配器在自己文件内自实现)
 	// 身份
 	LangID() LanguageID
 	MatchFile(path string) bool
@@ -213,6 +214,53 @@ type SignatureSource interface {
 	// HoverMarkdown 对文件某位置发起 hover 查询, 返回服务器 markdown 原文。
 	// ok=false = 无 hover 结果或请求失败。
 	HoverMarkdown(ctx context.Context, path string, line, char int) (string, bool)
+}
+
+// ---- 智能 workflow 契约 (各语言适配器在自己文件内自实现) ----
+
+// TextEdit 内存编辑片段 (LSP TextEdit 语义, 客户端列单位, 相对磁盘内容)。
+type TextEdit struct {
+	StartLine int    `json:"startLine"`
+	StartChar int    `json:"startChar"`
+	EndLine   int    `json:"endLine"`
+	EndChar   int    `json:"endChar"`
+	NewText   string `json:"newText"`
+}
+
+// WorkflowSource 宿主注入的 workflow 查询能力 (通用编排原语, 不含语言语义)。
+// 位置一律客户端单位进出 (宿主负责与服务器单位互转); 查询失败时的降级策略
+// 由各 provider 实现自己决定。Provider 通过它编排 batch workflow, 不直接碰连接。
+type WorkflowSource interface {
+	SignatureSource
+	// Definition/References/Hover 位置查询 (返回服务器原始 JSON, 由 provider
+	// 用自己的 ParseLocations/ParseHover 特化解析; ok=false = 查询失败)。
+	Definition(ctx context.Context, path string, line, char int) (json.RawMessage, bool)
+	References(ctx context.Context, path string, line, char int) (json.RawMessage, bool)
+	Hover(ctx context.Context, path string, line, char int) (json.RawMessage, bool)
+	// Diagnostics 取已整形的诊断 (shapeDiagnostics 口径); ok=false = 尚无推送。
+	Diagnostics(ctx context.Context, path string) (map[string]any, bool)
+	// Supports 该语言连接的服务器能力 (能力探测, 决定降级路径)。
+	Supports(cap Capability) bool
+	// PreviewText 发送合成 didChange (不落盘, 供 SimulateEdit 预览);
+	// 调用后必须 RestoreFile, 否则连接状态滞留合成内容。
+	PreviewText(ctx context.Context, path, text string) error
+	// RestoreFile 用磁盘内容 didChange 恢复 (清预览标记)。
+	RestoreFile(ctx context.Context, path string) error
+}
+
+// Workflows 智能 workflow 契约: 各语言适配器在自己文件内自实现。
+// 实现必须自包含在单个 *_capacity_provider.go (与 Provider 其他方法同铁律:
+// 可接受代码重复, 不接受共享实现造成的耦合)。
+type Workflows interface {
+	// BlastRadius 影响面: 定义 + 全部引用 (测试/非测试分区) + 关联诊断摘要, 一次返回。
+	BlastRadius(ctx context.Context, src WorkflowSource, path string, line, char int) (map[string]any, error)
+	// SimulateEdit 安全编辑预览: edits 作用于磁盘内容得合成文本 → PreviewText
+	// (不落盘) → 诊断 diff → RestoreFile; 返回 before/after 诊断与建议。
+	SimulateEdit(ctx context.Context, src WorkflowSource, path string, edits []TextEdit) (map[string]any, error)
+	// VerifyChain 修改后验证: 该文件诊断 + 编译/测试覆盖提示 (build/test 由 agent 跑)。
+	VerifyChain(ctx context.Context, src WorkflowSource, path string) (map[string]any, error)
+	// ExploreSymbol 符号理解: hover + 定义 + 引用 + 签名 enrich, 一把梭。
+	ExploreSymbol(ctx context.Context, src WorkflowSource, path string, line, char int) (map[string]any, error)
 }
 
 // ---- 注册表 (契约: provider 注册与查询的唯一入口) ----
