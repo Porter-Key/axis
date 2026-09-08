@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -19,16 +20,25 @@ import (
 	"github.com/Porter-Key/axis/internal/plugin"
 )
 
+// maxOpenServices 同时打开的项目库上限 (防不同项目无限累积): 超限逐出最久未用。
+const maxOpenServices = 32
+
+// svcEntry 缓存的开库条目 (带活跃度, 供逐出)。
+type svcEntry struct {
+	svc     *Service
+	lastUse time.Time
+}
+
 // Plugin memory 插件实例: 按激活项目懒开库, 缓存 open 的 Service。
 type Plugin struct {
 	gate *plugin.Gate
 
-	baseDir  string // 库根目录 (~/.local/state/axis/memory 或 config.Memory.DBPath 的目录)
+	baseDir   string // 库根目录 (~/.local/state/axis/memory 或 config.Memory.DBPath 的目录)
 	exportDir string
-	ext      string
+	ext       string
 
 	mu   sync.Mutex
-	svcs map[string]*Service // 库 key (project 根/global) → Service
+	svcs map[string]*svcEntry // 库 key (project 根/global) → 条目
 }
 
 // NewPlugin 构建 memory 插件。baseDir 是放各项目 .db 的目录。
@@ -40,7 +50,7 @@ func NewPlugin(baseDir, exportDir, ext string) *Plugin {
 		baseDir:   baseDir,
 		exportDir: exportDir,
 		ext:       ext,
-		svcs:      map[string]*Service{},
+		svcs:      map[string]*svcEntry{},
 	}
 }
 
@@ -83,20 +93,48 @@ func (p *Plugin) exportDirFor(project string) string {
 }
 
 // svcFor 取 (或懒开) 项目的 Service。project 为空=global。
+// 开库是磁盘 IO (sqlite Open + 建表): 锁外做, 不阻塞其他项目的并发请求;
+// 回填时双检, 并发先开者胜, 多余副本关闭。上限 maxOpenServices, 超限逐出最久未用。
 func (p *Plugin) svcFor(project string) (*Service, error) {
 	key := ProjectKey(project)
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if s, ok := p.svcs[key]; ok {
+	if e, ok := p.svcs[key]; ok {
+		e.lastUse = time.Now()
+		s := e.svc
+		p.mu.Unlock()
 		return s, nil
 	}
+	p.mu.Unlock()
+
 	db := dbPathFor(p.baseDir, key)
 	exp := p.exportDirFor(key)
 	s, err := OpenService(db, exp, p.ext)
 	if err != nil {
 		return nil, fmt.Errorf("memory 开库 %s: %w", db, err)
 	}
-	p.svcs[key] = s
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.svcs[key]; ok {
+		e.lastUse = time.Now()
+		_ = s.Close() // 并发下已被先开: 用已有的, 关多余副本
+		return e.svc, nil
+	}
+	if len(p.svcs) >= maxOpenServices {
+		var victim string
+		var oldest time.Time
+		first := true
+		for k, e := range p.svcs {
+			if first || e.lastUse.Before(oldest) {
+				victim, oldest, first = k, e.lastUse, false
+			}
+		}
+		if old, ok := p.svcs[victim]; ok {
+			delete(p.svcs, victim)
+			_ = old.svc.Close()
+		}
+	}
+	p.svcs[key] = &svcEntry{svc: s, lastUse: time.Now()}
 	return s, nil
 }
 
@@ -123,10 +161,10 @@ func (p *Plugin) Start(ctx context.Context) error { return nil }
 func (p *Plugin) Shutdown(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, s := range p.svcs {
-		_ = s.Close()
+	for _, e := range p.svcs {
+		_ = e.svc.Close()
 	}
-	p.svcs = map[string]*Service{}
+	p.svcs = map[string]*svcEntry{}
 	return nil
 }
 

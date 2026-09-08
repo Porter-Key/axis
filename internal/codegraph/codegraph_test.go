@@ -1,9 +1,14 @@
 package codegraph
 
 import (
+	"bytes"
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 func requireCodegraph(t *testing.T) {
@@ -61,4 +66,49 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestSyncGateSingleflight 回归 (P2-9): 并发查询同项目只 sync 一次,
+// 且 10s 新鲜窗口内后续查询直接跳过。用 fake bin 脚本计数真实 fork 次数。
+func TestSyncGateSingleflight(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".codegraph"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	countFile := filepath.Join(dir, "count")
+	script := filepath.Join(dir, "fake-cg.sh")
+	scriptBody := "#!/bin/sh\necho x >> \"" + countFile + "\"\nsleep 0.3\nexit 0\n"
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{bin: script, autoInit: false, syncOnChg: true, timeout: 10 * time.Second}
+
+	// 10 并发 → 只应 fork 1 次 sync
+	var wg sync.WaitGroup
+	errs := make([]error, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = c.syncGate(context.Background(), dir)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	data, _ := os.ReadFile(countFile)
+	if n := len(bytes.Split(bytes.TrimSpace(data), []byte("\n"))); n != 1 {
+		t.Errorf("10 并发只应 sync 1 次, 实际 %d 次", n)
+	}
+	// 新鲜窗口内再查 → 0 新增
+	if err := c.syncGate(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(countFile)
+	if n := len(bytes.Split(bytes.TrimSpace(data), []byte("\n"))); n != 1 {
+		t.Errorf("新鲜窗口内应跳过 sync, 实际累计 %d 次", n)
+	}
 }

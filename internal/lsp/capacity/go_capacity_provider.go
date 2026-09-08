@@ -10,6 +10,7 @@ import (
 
 	"github.com/Porter-Key/axis/internal/config"
 	"github.com/Porter-Key/axis/internal/lsp/client"
+	"github.com/Porter-Key/axis/internal/lsp/positions"
 )
 
 func init() { Register(&goProvider{}) }
@@ -402,4 +403,26 @@ func goSplitPlainDecl(decl string) (sig, doc string) {
 		doc = doc[:400] + "..."
 	}
 	return sig, doc
+}
+
+// ---- 位置编码 (go: 自包含决策 + positions 成熟实现) ----
+
+// ServerEncoding gopls 的位置编码: utf-16。
+// 本机实测 gopls v0.23.0 未在 general.positionEncodings 声明 (LSP 默认 utf-16)。
+// 若 gopls 未来声明 utf-8, 只改这里一处返回值, 换算与响应适配自动跟随。
+func (p *goProvider) ServerEncoding() string { return "utf-16" }
+
+// ToServerChar 客户端列 (UTF-8) → gopls 列。实现见 positions (全仓库唯一实现, 全面单测)。
+func (p *goProvider) ToServerChar(lineText string, clientChar int) int {
+	return positions.ToServer(p.ServerEncoding(), lineText, clientChar)
+}
+
+// FromServerChar gopls 列 → 客户端列 (UTF-8)。
+func (p *goProvider) FromServerChar(lineText string, serverChar int) int {
+	return positions.FromServer(p.ServerEncoding(), lineText, serverChar)
+}
+
+// AdaptPositionsToClient gopls 位置响应 → 客户端单位。walker 见 positions.AdaptPositions。
+func (p *goProvider) AdaptPositionsToClient(raw json.RawMessage, srcPath string, readLine ReadLine) json.RawMessage {
+	return positions.AdaptPositions(raw, srcPath, p.ServerEncoding(), readLine)
 }

@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"path/filepath"
 
-	"github.com/Porter-Key/axis/internal/codegraph"
 	"github.com/Porter-Key/axis/internal/config"
 )
 
@@ -64,43 +63,57 @@ func (a *App) ctrlHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) ctrlUnregister(w http.ResponseWriter, r *http.Request) {
+	if !a.auth(w, r) {
+		return
+	}
 	token := r.URL.Query().Get("token")
 	a.lsp.UnregisterSession(token)
 	a.writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (a *App) ctrlActivate(w http.ResponseWriter, r *http.Request) {
+	if !a.auth(w, r) {
+		return
+	}
 	// 预热: 项目下各语言的 LSP 提前拉起
 	root := r.URL.Query().Get("project")
 	abs, _ := filepath.Abs(root)
 	a.lsp.RegisterProject(abs)
-		a.lsp.StartMonitor(abs)
+	a.lsp.StartMonitor(abs)
 	a.writeJSON(w, 200, map[string]any{"ok": true, "project": abs, "note": "懒加载: 首个工具调用时才真正 spawn LSP"})
 }
 
 func (a *App) ctrlReload(w http.ResponseWriter, r *http.Request) {
-	// 热重载配置: 重新加载 config 文件 (adapter 变更生效)
-	newCfg, err := config.Load("")
+	if !a.auth(w, r) {
+		return
+	}
+	// 热重载配置: 用启动时的同一路径重新加载 (adapter/pool/超时/codegraph 即时生效;
+	// memory 库目录变更需重启, 这里只读不碰)。
+	newCfg, err := config.Load(a.cfgPath)
 	if err != nil {
 		a.writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
-	a.cfg = newCfg
-a.lsp.SetConfig(newCfg)
-	a.cg = codegraph.NewPlugin(newCfg.Codegraph)
-	a.writeJSON(w, 200, map[string]any{"ok": true, "adapters": langsList(newCfg)})
+	a.cfg.Store(newCfg)
+	a.lsp.SetConfig(newCfg) // 透传 registry (不透传等于没重载)
+	a.cg.SetConfig(newCfg.Codegraph)
+	a.writeJSON(w, 200, map[string]any{"ok": true, "adapters": langsList(newCfg),
+		"config": config.ResolvePath(a.cfgPath), "note": "memory 库目录变更需重启生效"})
 }
 
 func (a *App) ctrlStatus(w http.ResponseWriter, r *http.Request) {
+	if !a.auth(w, r) {
+		return
+	}
 	a.writeJSON(w, 200, a.lsp.Status())
 }
 
 func (a *App) auth(w http.ResponseWriter, r *http.Request) bool {
-	if a.cfg.CtrlToken == "" {
+	if a.cfg.Load().CtrlToken == "" {
 		return true // 无 token 则信任 (localhost)
 	}
 	tok := r.Header.Get("X-Ctrl-Token")
-	if tok != a.cfg.CtrlToken {
+	if tok != a.cfg.Load().CtrlToken {
 		a.writeJSON(w, 401, map[string]any{"error": "unauthorized"})
 		return false
 	}

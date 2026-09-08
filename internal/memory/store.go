@@ -187,8 +187,8 @@ func (s *Store) InLinks(key string) ([]LinkRef, error) {
 
 // SearchHit 命中结果。
 type SearchHit struct {
-	Key   string
-	Title string
+	Key     string
+	Title   string
 	Snippet string
 }
 

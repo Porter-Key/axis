@@ -1,10 +1,10 @@
 // Package axis — axis 壳: 组装各子插件 (LSP/codegraph/memory) 为统一 MCP server + 控制面。
 //
 // 架构 (用户确认): 一个服务 + 多个子插件。壳不持有业务, 只做:
-//   1. 构造插件 (依赖 config/logger)
-//   2. 统一注册进同一 MCP server
-//   3. 控制面 HTTP (/ctrl: 注册/心跳/状态/重载) — 委托给相关插件能力
-//   4. 会话激活门禁: axis_activate(project) 绑定 MCP 会话→项目, 未激活拒绝目录级工具
+//  1. 构造插件 (依赖 config/logger)
+//  2. 统一注册进同一 MCP server
+//  3. 控制面 HTTP (/ctrl: 注册/心跳/状态/重载) — 委托给相关插件能力
+//  4. 会话激活门禁: axis_activate(project) 绑定 MCP 会话→项目, 未激活拒绝目录级工具
 package axis
 
 import (
@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -27,22 +29,34 @@ import (
 
 // App 壳。
 type App struct {
-	cfg     *config.Config
+	// cfg 热重载可换指针: atomic (ctrl 面 HTTP handler 并发读, ctrlReload 并发写)。
+	cfg     atomic.Pointer[config.Config]
+	cfgPath string // 启动时的 -config 传入值 (可为 "", 由 config.ResolvePath 解析); ctrlReload 复用
 	plugins []plugin.ToolProvider
 	// 具名引用 (控制面/热重载需要特定插件能力)
-	lsp  *lsp.LSP
-	cg   *codegraph.Plugin
-	mem  *memory.Plugin
-	MS   *server.MCPServer
+	lsp *lsp.LSP
+	cg  *codegraph.Plugin
+	mem *memory.Plugin
+	MS  *server.MCPServer
 
 	gate *plugin.Gate // 会话→激活项目门禁
 
 	muReload sync.Mutex
 }
 
+// axisMCPVersion axis 自身 MCP server 版本。
+// 注意这是另一套版本域, 与 codegraph 后端版本 (indexStatus.version, 当前 1.6.0)
+// 无关: 一个是本服务发版, 一个是图谱索引格式/后端, 升级时不要误判漂移。
+const axisMCPVersion = "0.3.1"
+
 // New 组装全部插件。
 func New(cfg *config.Config) (*App, error) {
-	a := &App{cfg: cfg, gate: plugin.NewGate()}
+	a := &App{gate: plugin.NewGate()}
+	a.cfg.Store(cfg)
+	// Gate 绑定 TTL 与 registry 会话心跳超时同口径 (滑动窗口, 活跃会话永不过期)。
+	if hb := time.Duration(cfg.Heartbeat.TimeoutSec) * time.Second; hb > 0 {
+		a.gate.SetTTL(hb)
+	}
 
 	// 子插件: LSP / codegraph / memory
 	lspPlugin := lsp.New(cfg)
@@ -57,7 +71,7 @@ func New(cfg *config.Config) (*App, error) {
 	a.mem = memPlugin
 	a.plugins = []plugin.ToolProvider{lspPlugin, cgPlugin, memPlugin}
 
-	ms := server.NewMCPServer("axis", "0.3.1",
+	ms := server.NewMCPServer("axis", axisMCPVersion,
 		server.WithDescription("axis: 多语言 LSP 语义 + codegraph 图谱 + memory 知识库 MCP server。"+langsList(cfg)))
 	a.MS = ms
 	// 门禁注入各插件 (目录级工具激活检查)
@@ -73,6 +87,10 @@ func New(cfg *config.Config) (*App, error) {
 	return a, nil
 }
 
+// SetConfigPath 记录启动配置路径 (main 在 New 后调用, 供 ctrlReload 复用,
+// 否则重载会丢 -config 读到另一个文件)。
+func (a *App) SetConfigPath(p string) { a.cfgPath = p }
+
 // handleActivate axis_activate: 绑定当前会话到项目。
 func (a *App) handleActivate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	sid := plugin.SessionIDFromContext(ctx)
@@ -86,7 +104,7 @@ func (a *App) handleActivate(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	}
 	abs, err := filepath.Abs(proj)
 	if err != nil {
-		return mcpkit.ErrRes("project 解析失败: "+err.Error()), nil
+		return mcpkit.ErrRes("project 解析失败: " + err.Error()), nil
 	}
 	a.gate.Activate(sid, abs)
 	// 同步注册项目到 LSP registry + 启动 fsmonitor
@@ -159,4 +177,3 @@ func langsList(cfg *config.Config) string {
 	}
 	return "支持: " + strings.Join(ls, ", ")
 }
-

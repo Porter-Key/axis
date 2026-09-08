@@ -33,6 +33,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(2)
 	}
+	resolvedCfg := *cfgPath
+	if resolvedCfg == "" {
+		resolvedCfg = config.ResolvePath("")
+		if resolvedCfg == "" {
+			resolvedCfg = "(内置默认, 无配置文件)"
+		}
+	}
 
 	// 结构化日志 (JSONL) — 先于一切初始化
 	if cfg.Log.Path == "" {
@@ -42,13 +49,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "logger: %v\n", err)
 		os.Exit(2)
 	}
-	logger.L().Info("server starting", "http", *httpMode, "addr", *addr, "config", cfgPath, "log", cfg.Log.Path)
+	logger.L().Info("server starting", "http", *httpMode, "addr", *addr, "config", resolvedCfg, "log", cfg.Log.Path)
 
 	app, err := axis.New(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "axis: %v\n", err)
 		os.Exit(2)
 	}
+	app.SetConfigPath(*cfgPath) // ctrlReload 复用同一路径
 	if err := app.Start(context.Background()); err != nil {
 		fmt.Fprintf(os.Stderr, "start plugins: %v\n", err)
 		os.Exit(2)
@@ -56,6 +64,16 @@ func main() {
 	ms := app.MCPServer()
 
 	if !*httpMode {
+		// stdio 也接信号: 否则 Ctrl-C 直接杀进程, gopls 等子进程变孤儿常驻。
+		// 注意 signal.Notify 会接管 SIGINT 默认行为, 因此 Shutdown 后必须显式退出。
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-stop
+			fmt.Fprintln(os.Stderr, "shutting down...")
+			_ = app.Shutdown()
+			os.Exit(0)
+		}()
 		if err := server.ServeStdio(ms); err != nil {
 			fmt.Fprintf(os.Stderr, "stdio serve: %v\n", err)
 			os.Exit(1)
@@ -82,10 +100,12 @@ func main() {
 	go func() {
 		<-stop
 		fmt.Fprintln(os.Stderr, "shutting down...")
+		// 先 drain HTTP (5s 内不再接新请求, 在飞请求完成), 再关插件:
+		// 顺序反了会在飞的 MCP 查询正查到一半时 LSP 池被杀。
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = app.Shutdown()
 		_ = hs.Shutdown(ctx)
+		_ = app.Shutdown()
 	}()
 	fmt.Fprintf(os.Stderr, "axis HTTP listening on http://%s/mcp (ctrl: /ctrl/)\n", *addr)
 	if err := hs.Serve(ln); err != nil && err != http.ErrServerClosed {

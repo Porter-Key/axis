@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Porter-Key/axis/internal/logger"
 )
 
 // LangAdapter 描述一个语言 -> LSP server 的适配器。
@@ -121,9 +123,7 @@ func Default() *Config {
 // 与默认合并 (文件中的字段覆盖默认)。
 func Load(path string) (*Config, error) {
 	cfg := Default()
-	if path == "" {
-		path = searchDefault()
-	}
+	path = ResolvePath(path)
 	if path == "" {
 		return cfg, nil // 无配置文件, 用默认
 	}
@@ -138,8 +138,20 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &fileCfg); err != nil {
 		return nil, fmt.Errorf("解析配置 %s (YAML): %w", path, err)
 	}
-	// 合并: 文件中的 adapter 覆盖默认同语言, 新增语言追加
+	// 合并: 文件中的 adapter 覆盖默认同语言, 新增语言追加。
+	// 注意整语言替换是覆盖语义: 若文件版 file_patterns/markers 为空, 默认的匹配规则
+	// 会被静默丢弃 (该语言退化为"无匹配"), 这里显式警告, 免得配错后排障抓瞎。
 	for k, a := range fileCfg.Adapters {
+		if d, ok := cfg.Adapters[k]; ok {
+			if len(a.FilePatterns) == 0 && len(d.FilePatterns) > 0 {
+				logger.With("lang", k).Warn("adapter 整语言替换丢弃了默认 file_patterns (该语言将无文件匹配)",
+					"hint", "如需保留请在 YAML 中显式声明 file_patterns")
+			}
+			if len(a.Markers) == 0 && len(d.Markers) > 0 {
+				logger.With("lang", k).Warn("adapter 整语言替换丢弃了默认 markers (项目根定位可能漂移)",
+					"hint", "如需保留请在 YAML 中显式声明 markers")
+			}
+		}
 		cfg.Adapters[k] = a
 	}
 	mergeHeartbeat(&cfg.Heartbeat, &fileCfg.Heartbeat)
@@ -177,19 +189,51 @@ func Load(path string) (*Config, error) {
 		cfg.Log.Level = fileCfg.Log.Level
 	}
 	cfg.Log.Also = fileCfg.Log.Also
+	// 数值钳位 (单点真相, 下游 registry/reapLoop 不再各自防御):
+	// MaxServers<1 会让 LRU 逐出取 poolOrder[0] panic; IdleTTLSec/Heartbeat<=0
+	// 会让回收循环把"全部连接/会话"当过期清掉 (接近活锁)。非法值直接回默认。
+	if cfg.Pool.MaxServers < 1 {
+		cfg.Pool.MaxServers = 6
+	}
+	if cfg.Pool.IdleTTLSec <= 0 {
+		cfg.Pool.IdleTTLSec = 900
+	}
+	if cfg.Heartbeat.TimeoutSec <= 0 {
+		cfg.Heartbeat.TimeoutSec = 60
+	}
+	if cfg.Heartbeat.IntervalSec < 0 {
+		cfg.Heartbeat.IntervalSec = 15
+	}
 	return cfg, nil
 }
 
-// searchDefault 按约定搜索配置: ~/.config/mcp/axis/config.yaml (XDG 优先)。
-func searchDefault() string {
-	cands := []string{
-		"configs/axis.yaml",
-		"axis.yaml",
+// ResolvePath 解析实际使用的配置文件路径 ("" = 无配置文件, 用内置默认)。
+// 显式路径原样返回 (存在性由 Load 判定); 空则按约定搜索。main 日志与 ctrlReload
+// 必须经这里拿路径, 否则运维无法确认线上跑的是哪个文件。
+func ResolvePath(path string) string {
+	if path != "" {
+		return path
 	}
+	return searchDefault()
+}
+
+// searchDefault 按约定搜索配置, 优先级: XDG 标准路径 > 可执行文件所在目录 >
+// 当前工作目录。CWD 放最后是有意的: systemd 常驻与开发 shell 的 CWD 不同,
+// 之前 CWD 优先会导致同一份 binary 在两种环境读到不同配置 (且 main 日志难排查)。
+// 返回值恒为绝对路径 ("") = 无配置文件, 用内置默认。
+func searchDefault() string {
+	var cands []string
 	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
 		cands = append(cands, filepath.Join(x, "mcp", "axis", "config.yaml"))
 	} else if h, err := os.UserHomeDir(); err == nil {
 		cands = append(cands, filepath.Join(h, ".config", "mcp", "axis", "config.yaml"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		cands = append(cands, filepath.Join(dir, "configs", "axis.yaml"), filepath.Join(dir, "axis.yaml"))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		cands = append(cands, filepath.Join(cwd, "configs", "axis.yaml"), filepath.Join(cwd, "axis.yaml"))
 	}
 	for _, c := range cands {
 		if _, err := os.Stat(c); err == nil {

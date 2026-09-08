@@ -7,6 +7,7 @@ package lsp
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -19,8 +20,9 @@ import (
 
 // LSP 插件实例 (自治: 持自己的全部状态)。
 type LSP struct {
-	cfg *config.Config
-	reg *registry.Registry
+	// cfg 热重载可换指针: atomic (handler 并发读, SetConfig 并发写)。
+	cfg  atomic.Pointer[config.Config]
+	reg  *registry.Registry
 	gate *plugin.Gate
 
 	monitors map[string]*fsmonitor.Monitor // root -> monitor
@@ -33,11 +35,12 @@ type LSP struct {
 
 // New 构建 LSP 插件。
 func New(cfg *config.Config) *LSP {
-	return &LSP{
-		cfg:      cfg,
+	l := &LSP{
 		reg:      registry.New(cfg),
 		monitors: map[string]*fsmonitor.Monitor{},
 	}
+	l.cfg.Store(cfg)
+	return l
 }
 
 // Name 插件名。
@@ -53,10 +56,19 @@ func (l *LSP) Gate() *plugin.Gate { return l.gate }
 func (l *LSP) Registry() *registry.Registry { return l.reg }
 
 // Config 暴露配置 (reload 用)。
-func (l *LSP) Config() *config.Config { return l.cfg }
+func (l *LSP) Config() *config.Config { return l.cfg.Load() }
+
+// getConfig 取当前配置指针 (handler 读路径统一入口, atomic Load)。
+func (l *LSP) getConfig() *config.Config { return l.cfg.Load() }
 
 // SetConfig 更新配置 (热重载)。
-func (l *LSP) SetConfig(cfg *config.Config) { l.cfg = cfg }
+func (l *LSP) SetConfig(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	l.cfg.Store(cfg)
+	l.reg.SetConfig(cfg) // 透传 registry, 否则 adapters/pool 改了不生效
+}
 
 // Register 注册 LSP 工具。
 func (l *LSP) Register(ms *server.MCPServer) {
@@ -64,22 +76,22 @@ func (l *LSP) Register(ms *server.MCPServer) {
 		mcp.WithDescription("返回文件某位置符号的定义位置。scope 可选: definition(默认)|implementation|typeDefinition, 按语言服务器能力降级。"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径")),
 		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
-		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based)")),
+		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
 		mcp.WithString("scope", mcp.Description("查询范围: definition|implementation|typeDefinition (默认 definition)")),
 	), l.handleDefinition)
 
 	ms.AddTool(mcp.NewTool("get_hover",
 		mcp.WithDescription("返回文件某位置的悬停信息 (类型/文档)。"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径")),
-		mcp.WithNumber("line", mcp.Required()),
-		mcp.WithNumber("character", mcp.Required()),
+		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
+		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
 	), l.handleLSPRequest("hover"))
 
 	ms.AddTool(mcp.NewTool("get_references",
 		mcp.WithDescription("返回符号在项目内的全部引用位置 (落点附签名块)。"),
 		mcp.WithString("path", mcp.Required()),
-		mcp.WithNumber("line", mcp.Required()),
-		mcp.WithNumber("character", mcp.Required()),
+		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
+		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
 	), l.handleLSPRequest("references"))
 
 	ms.AddTool(mcp.NewTool("get_diagnostics",
@@ -90,8 +102,8 @@ func (l *LSP) Register(ms *server.MCPServer) {
 	ms.AddTool(mcp.NewTool("get_rename",
 		mcp.WithDescription("计算符号重命名的影响范围 (编辑点列表)。"),
 		mcp.WithString("path", mcp.Required()),
-		mcp.WithNumber("line", mcp.Required()),
-		mcp.WithNumber("character", mcp.Required()),
+		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
+		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
 		mcp.WithString("newName", mcp.Required()),
 	), l.handleRename)
 

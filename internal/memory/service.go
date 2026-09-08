@@ -10,9 +10,9 @@ import (
 // Service memory 子模块编排层: 组合 Store + md 解析 + 导出。
 // 所有 mem_* MCP 工具都经这里 (唯一写入口)。
 type Service struct {
-	store    *Store
+	store     *Store
 	exportDir string
-	ext      string
+	ext       string
 }
 
 // NewService 构建 Service (需已 Open 的 store)。
@@ -176,7 +176,7 @@ func detectLinkHints(body string) []string {
 		low := strings.ToLower(trimmed)
 		for _, marker := range []string{"(link:", "(连线:", "(connect:"} {
 			if strings.HasPrefix(low, marker) && strings.Contains(trimmed, ")") {
-				content := trimmed[len(marker) : strings.Index(trimmed, ")")]
+				content := trimmed[len(marker):strings.Index(trimmed, ")")]
 				hints = append(hints, fmt.Sprintf("正文含连线指示 %q — 链接只存在于 DB, 请用 mem_link 手动建立", content))
 				break
 			}

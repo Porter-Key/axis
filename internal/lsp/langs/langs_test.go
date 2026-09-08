@@ -79,3 +79,38 @@ func TestDefaultHasAllLanguages(t *testing.T) {
 		}
 	}
 }
+
+func TestFindProjectRootBounded(t *testing.T) {
+	cfg := config.Default()
+	tmp := t.TempDir()
+	// tmp/go.mod, tmp/sub/deep/f.go (sub 内无 marker)
+	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deep := filepath.Join(tmp, "sub", "deep")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(deep, "f.go")
+	sub := filepath.Join(tmp, "sub")
+
+	// 不限界: 找到祖先 tmp
+	if root, _, ok := FindProjectRootBounded(cfg, "go", file, ""); !ok || root != tmp {
+		t.Errorf("unbounded: root=%q ok=%v, want %q", root, ok, tmp)
+	}
+	// 限界到 sub: marker 在边界外 → 不得上浮, 返回 false (调用方兜底 boundary)
+	if _, _, ok := FindProjectRootBounded(cfg, "go", file, sub); ok {
+		t.Error("bounded(sub): marker above boundary must not match")
+	}
+	// 限界到 tmp 自身: 本层 marker 有效
+	if root, _, ok := FindProjectRootBounded(cfg, "go", file, tmp); !ok || root != tmp {
+		t.Errorf("bounded(tmp): root=%q ok=%v, want %q", root, ok, tmp)
+	}
+	// 边界内侧 marker 优先: sub/go.mod → 定根 sub
+	if err := os.WriteFile(filepath.Join(sub, "go.mod"), []byte("module y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if root, _, ok := FindProjectRootBounded(cfg, "go", file, sub); !ok || root != sub {
+		t.Errorf("bounded inner marker: root=%q ok=%v, want %q", root, ok, sub)
+	}
+}

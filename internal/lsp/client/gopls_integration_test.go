@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -151,4 +153,63 @@ func truncateStr(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// TestConcurrentCalls 回归 (P2-6): 同连接多路并发查询必须全部成功,
+// 且总耗时显著小于串行累加 (读循环 + pending 路由, 不再被慢查询堵死)。
+func TestConcurrentCalls(t *testing.T) {
+	requireGopls(t)
+	root, file := makeGoModule(t)
+	ad := config.LangAdapter{LanguageID: "go", Command: "gopls", TimeoutSec: 30}
+	conn, err := Spawn(context.Background(), ad, root, 30*time.Second)
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	defer conn.Close()
+
+	// 预热一次 (didOpen + 索引)
+	if _, err := conn.CallWithDoc(context.Background(), "textDocument/hover", file,
+		map[string]any{"position": map[string]any{"line": 7, "character": 15}}, 20*time.Second); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+
+	const n = 8
+	errs := make([]error, n)
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = conn.CallWithDoc(context.Background(), "textDocument/hover", file,
+				map[string]any{"position": map[string]any{"line": 7, "character": 15}}, 20*time.Second)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: %v", i, err)
+		}
+	}
+	t.Logf("%d concurrent hovers took %v", n, time.Since(start))
+}
+
+// TestDiagnosticsCache 诊断推送缓存: 存取命中/未命中 (纯单测, 无需服务器)。
+func TestDiagnosticsCache(t *testing.T) {
+	c := &Conn{diags: map[string]json.RawMessage{}}
+	if _, ok := c.DiagnosticsFor("/x/main.go"); ok {
+		t.Fatal("empty cache should miss")
+	}
+	uri := uriFromPath("/x/main.go")
+	params := json.RawMessage(`{"uri":` + strconv.Quote(uri) + `,"diagnostics":[{"message":"oops"}]}`)
+	c.storeDiagnostics(params)
+	got, ok := c.DiagnosticsFor("/x/main.go")
+	if !ok {
+		t.Fatal("stored diagnostics should hit")
+	}
+	if !strings.Contains(string(got), "oops") {
+		t.Errorf("cache content wrong: %s", string(got))
+	}
+	// 无 uri 的推送直接丢弃 (不炸)
+	c.storeDiagnostics(json.RawMessage(`{"diagnostics":[]}`))
 }

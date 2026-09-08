@@ -9,6 +9,7 @@ import (
 
 	"github.com/Porter-Key/axis/internal/config"
 	"github.com/Porter-Key/axis/internal/lsp/client"
+	"github.com/Porter-Key/axis/internal/lsp/positions"
 )
 
 func init() {
@@ -319,4 +320,26 @@ func rustSymbolName(sig string) string {
 		s = s[:i]
 	}
 	return strings.TrimSpace(s)
+}
+
+// ---- 位置编码 (rust: 自包含决策 + positions 成熟实现) ----
+
+// ServerEncoding rust-analyzer 的位置编码: utf-8 (LSP 3.17, 文件头注释)。
+// 客户端口径同为 UTF-8 (见 ClientCharEncoding), positions 内走快路直通;
+// 若 ServerEncoding 变更, 换算与响应适配自动跟随 (只改这里一处)。
+func (p *rustProvider) ServerEncoding() string { return "utf-8" }
+
+// ToServerChar 客户端列 → rust-analyzer 列。实现见 positions。
+func (p *rustProvider) ToServerChar(lineText string, clientChar int) int {
+	return positions.ToServer(p.ServerEncoding(), lineText, clientChar)
+}
+
+// FromServerChar rust-analyzer 列 → 客户端列。
+func (p *rustProvider) FromServerChar(lineText string, serverChar int) int {
+	return positions.FromServer(p.ServerEncoding(), lineText, serverChar)
+}
+
+// AdaptPositionsToClient rust-analyzer 位置响应 → 客户端单位。walker 见 positions.AdaptPositions。
+func (p *rustProvider) AdaptPositionsToClient(raw json.RawMessage, srcPath string, readLine ReadLine) json.RawMessage {
+	return positions.AdaptPositions(raw, srcPath, p.ServerEncoding(), readLine)
 }

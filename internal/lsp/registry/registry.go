@@ -7,12 +7,16 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Porter-Key/axis/internal/config"
@@ -39,16 +43,19 @@ type Session struct {
 
 // Registry 总控。
 type Registry struct {
-	cfg *config.Config
+	// cfg 热重载可换指针: 必须 atomic (reapLoop/请求路径并发读, SetConfig 并发写;
+	// plain swap 在 -race 下实锤竞态)。*Config 一经 Load 即不可变, 只换指针不改字段。
+	cfg atomic.Pointer[config.Config]
 
 	mu       sync.Mutex
 	projects map[string]*Project // root -> project
 	sessions map[string]*Session // token -> session
 
-	poolMu    sync.Mutex
-	pool      map[string]*lspclient.Conn // key: root|lang
-	poolOrder []string                   // LRU 顺序 (尾部最新)
-	poolCtx   context.Context
+	poolMu     sync.Mutex
+	pool       map[string]*lspclient.Conn // key: root|lang
+	poolOrder  []string                   // LRU 顺序 (尾部最新)
+	poolCtx    context.Context
+	poolCancel context.CancelFunc // 停 reapLoop 用 (Shutdown 调用, 之前版本 _ = cancel 导致循环永生)
 
 	// 崩溃自愈: key(root|lang) -> 退避截止时间; 崩溃重启失败后指数退避重试。
 	backoffMu     sync.Mutex
@@ -60,7 +67,6 @@ type Registry struct {
 func New(cfg *config.Config) *Registry {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Registry{
-		cfg:           cfg,
 		projects:      map[string]*Project{},
 		sessions:      map[string]*Session{},
 		pool:          map[string]*lspclient.Conn{},
@@ -68,7 +74,8 @@ func New(cfg *config.Config) *Registry {
 		crashBackoff:  map[string]time.Time{},
 		crashAttempts: map[string]int{},
 	}
-	_ = cancel
+	r.cfg.Store(cfg)
+	r.poolCancel = cancel
 	go r.reapLoop(ctx)
 	return r
 }
@@ -99,13 +106,17 @@ func (r *Registry) clearBackoff(key string) {
 	delete(r.crashAttempts, key)
 }
 
-// Shutdown 停止所有回收并关闭全部 LSP。
+// Shutdown 停止回收循环并关闭全部 LSP。
 func (r *Registry) Shutdown() {
+	if r.poolCancel != nil {
+		r.poolCancel() // 先停 reapLoop, 避免关闭后它又重启连接
+	}
 	r.poolMu.Lock()
 	defer r.poolMu.Unlock()
-	for k, c := range r.pool {
-		_ = c.Close()
-		delete(r.pool, k)
+	for k := range r.pool {
+		if c := r.removeFromPool(k); c != nil {
+			_ = c.Close()
+		}
 	}
 }
 
@@ -180,9 +191,10 @@ func (r *Registry) LSPConn(ctx context.Context, projectRoot, lang string, lazySp
 	r.poolMu.Lock()
 	if c, ok := r.pool[key]; ok {
 		// 崩溃检测: 进程死了 → 移除, 走下方重启
-		if !c.IsAlive() {
-			_ = c.Close()
-			delete(r.pool, key)
+		if c == nil || !c.IsAlive() {
+			if old := r.removeFromPool(key); old != nil {
+				_ = old.Close()
+			}
 		} else {
 			// 退避期内? (reap 刚失败过) → 仍可用旧连接? 不, 已删; 直接正常返回
 			// 移到 LRU 尾部
@@ -204,16 +216,18 @@ func (r *Registry) LSPConn(ctx context.Context, projectRoot, lang string, lazySp
 		return nil, fmt.Errorf("LSP for %s 崩溃自愈退避中 (%.0fs 后重试)", lang, time.Until(until).Seconds())
 	}
 	// 检查 LRU 上限
-	if len(r.pool) >= r.cfg.Pool.MaxServers {
+	max := r.cfg.Load().Pool.MaxServers
+	if max <= 0 {
+		max = 1 // 防御: 配置为 0 时 poolOrder[0] 会 panic
+	}
+	if len(r.pool) >= max && len(r.poolOrder) > 0 {
 		// 逐出最久未用 (头部)
 		evict := r.poolOrder[0]
-		if old, ok := r.pool[evict]; ok {
+		if old := r.removeFromPool(evict); old != nil {
 			go old.Close()
-			delete(r.pool, evict)
 		}
-		r.poolOrder = r.poolOrder[1:]
 	}
-	ad, ok := r.cfg.Adapters[lang]
+	ad, ok := r.cfg.Load().Adapters[lang]
 	if !ok {
 		r.poolMu.Unlock()
 		return nil, fmt.Errorf("无语言适配器: %s", lang)
@@ -244,6 +258,22 @@ func (r *Registry) LSPConn(ctx context.Context, projectRoot, lang string, lazySp
 	return conn, nil
 }
 
+// removeFromPool 从池与 LRU 顺序中同时移除 key, 返回被移除的连接。
+// 调用方必须持有 poolMu。维护不变量: pool 的 key 集合 == poolOrder 集合 (无重复、无幽灵)。
+// 所有删除点必须走这里, 否则驱逐可能拿到已删 key 的陈旧副本而误杀存活连接。
+func (r *Registry) removeFromPool(key string) *lspclient.Conn {
+	c := r.pool[key]
+	delete(r.pool, key)
+	kept := r.poolOrder[:0]
+	for _, k := range r.poolOrder {
+		if k != key {
+			kept = append(kept, k)
+		}
+	}
+	r.poolOrder = kept
+	return c
+}
+
 func (r *Registry) touchLRU(key string) {
 	for i, k := range r.poolOrder {
 		if k == key {
@@ -272,7 +302,7 @@ func (r *Registry) CallWithDoc(ctx context.Context, projectRoot, lang, method, f
 	if !conn.IsAlive() || isDeadConnErr(err) {
 		r.poolMu.Lock()
 		if c, ok := r.pool[key]; ok && c == conn {
-			delete(r.pool, key)
+			r.removeFromPool(key)
 			go conn.Close() // 回收僵尸
 		}
 		r.poolMu.Unlock()
@@ -300,18 +330,50 @@ func (r *Registry) CallWithDoc(ctx context.Context, projectRoot, lang, method, f
 	return nil, err
 }
 
-// isDeadConnErr 连接死亡类错误特征 (写入已死进程/读 EOF 等)。
+// isDeadConnErr 判断是否为传输层死亡 (stdio 管道断了), 值得自愈重启。
+// 刻意收窄: 只认 syscall 级断管信号。旧版含 "write"/"eof"/"io error" 等宽泛子串,
+// 会把健康服务器的普通错误 (如 "failed to write response") 误判死亡而误杀重启。
 func isDeadConnErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, io.EOF) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.EPIPE || errno == syscall.ECONNRESET
+	}
+	// 跨进程边界后 errno 常丢成纯文本, 兜底精确短语 (绝不含裸 "write"/"eof")
 	s := strings.ToLower(err.Error())
-	for _, frag := range []string{"broken pipe", "epipe", "connection reset", "eof", "closed pipe", "write", "input/output error", "io error"} {
+	for _, frag := range []string{"broken pipe", "closed pipe", "connection reset by peer", "epipe"} {
 		if strings.Contains(s, frag) {
 			return true
 		}
 	}
 	return false
+}
+
+// SetConfig 热更新配置 (ctrlReload 路径)。
+// *Config 一经 Load 即不可变 (只做指针交换, 从不就地改字段): 并发读者要么看到
+// 旧配置要么看到新配置, 不存在中间状态。指针交换本身经 atomic, 与 reapLoop/
+// 请求路径的并发读无竞态。新 spawn/驱逐/心跳参数即时生效, 已有连接保持 (不断连)。
+func (r *Registry) SetConfig(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	r.cfg.Store(cfg)
+}
+
+// DiagnosticsFor 取常驻连接的推送诊断缓存 (不 spawn; 无连接/无推送返回 nil,false)。
+// publishDiagnostics 是服务器推送语义: "无缓存" ≠ "零报错", 调用方必须区分呈现。
+func (r *Registry) DiagnosticsFor(projectRoot, lang, path string) (json.RawMessage, bool) {
+	r.poolMu.Lock()
+	defer r.poolMu.Unlock()
+	if c, ok := r.pool[projectRoot+"|"+lang]; ok && c != nil {
+		return c.DiagnosticsFor(path)
+	}
+	return nil, false
 }
 
 // InvalidateProject 项目文件变更 → 该 root 下所有常驻 LSP 连接:
@@ -321,22 +383,39 @@ func isDeadConnErr(err error) bool {
 // changedPaths 为空 = 项目级失效 (dirtyAll); 非空 = 精确文件失效。
 // 由 fsmonitor 消费循环调用 (长连接重新索引/同步的入口)。
 func (r *Registry) InvalidateProject(root string, changedPaths []string) {
+	// 快照后锁外通知: Notify/Invalidate 内部是 IPC 写 (watched-files/didChange 全量),
+	// 持 poolMu 会堵死整个池的并发查询。语义与原来完全一致, 只是挪出锁。
+	type target struct {
+		c       *lspclient.Conn
+		changed []string // nil = 项目级失效 (dirtyAll)
+	}
 	r.poolMu.Lock()
-	defer r.poolMu.Unlock()
 	prefix := root + "|"
+	var targets []target
 	n := 0
 	for k, c := range r.pool {
 		if strings.HasPrefix(k, prefix) {
 			n++
-			if len(changedPaths) == 0 {
-				// 项目级失效: 无法精确同步 → dirtyAll (下次任一文件请求 didChange 全量重读)
-				c.Invalidate("")
+			if c == nil {
 				continue
 			}
-			// 精确变更: NotifyProjectChanged 内部对已打开文档发 didChange 全量,
-			// 未打开文档发 didChangeWatchedFiles (服务器自行读盘)。内容已同步,
-			// 无需再标脏。
-			c.NotifyProjectChanged(changedPaths)
+			if len(changedPaths) == 0 {
+				// 项目级失效: 无法精确同步 → dirtyAll (下次任一文件请求 didChange 全量重读)
+				targets = append(targets, target{c: c})
+			} else {
+				// 精确变更: NotifyProjectChanged 内部对已打开文档发 didChange 全量,
+				// 未打开文档发 didChangeWatchedFiles (服务器自行读盘)。内容已同步,
+				// 无需再标脏。
+				targets = append(targets, target{c: c, changed: changedPaths})
+			}
+		}
+	}
+	r.poolMu.Unlock()
+	for _, t := range targets {
+		if t.changed == nil {
+			t.c.Invalidate("")
+		} else {
+			t.c.NotifyProjectChanged(t.changed)
 		}
 	}
 	logger.With("root", root, "conns", n).Info("invalidate project", "paths", len(changedPaths), "dirtyAll", len(changedPaths) == 0)
@@ -394,10 +473,6 @@ func (r *Registry) RegisterProjectLangs(root string, langs ...string) {
 }
 
 func (r *Registry) reapLoop(ctx context.Context) {
-	hbTimeout := time.Duration(r.cfg.Heartbeat.TimeoutSec) * time.Second
-	idleTTL := time.Duration(r.cfg.Pool.IdleTTLSec) * time.Second
-	memLimit := int64(r.cfg.Pool.MemoryLimitMB) * 1024 * 1024
-
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -405,6 +480,11 @@ func (r *Registry) reapLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 每轮重读配置指针: 热重载后的心跳/空闲/内存阈值即时生效 (atomic Load, 无锁)。
+			cfg := r.cfg.Load()
+			hbTimeout := time.Duration(cfg.Heartbeat.TimeoutSec) * time.Second
+			idleTTL := time.Duration(cfg.Pool.IdleTTLSec) * time.Second
+			memLimit := int64(cfg.Pool.MemoryLimitMB) * 1024 * 1024
 			now := time.Now()
 			// 1. 会话心跳超时 → 注销
 			r.mu.Lock()
@@ -433,42 +513,33 @@ func (r *Registry) reapLoop(ctx context.Context) {
 			}
 			// 先关空闲/超限
 			for _, k := range toClose {
-				if c, ok := r.pool[k]; ok {
-					go c.Close()
-					delete(r.pool, k)
+				if old := r.removeFromPool(k); old != nil {
+					go old.Close()
 				}
 			}
 			// 再重启崩溃的 (异步, 不阻塞 reap 循环)
 			for _, k := range toRestart {
-				if c, ok := r.pool[k]; ok {
-					_ = c.Close() // 确保僵尸进程清掉
-					delete(r.pool, k)
-					parts := strings.SplitN(k, "|", 2)
-					if len(parts) == 2 {
-						key := k
-						root, lang := parts[0], parts[1]
-						go func() {
-							ctx2, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-							defer cancel()
-							if _, err := r.LSPConn(ctx2, root, lang, true); err != nil {
-								// 重启失败: 记录并退避 (下次 reap 再试)
-								r.backoffMu.Lock()
-								r.crashBackoff[key] = time.Now().Add(r.nextBackoff(key))
-								r.backoffMu.Unlock()
-							}
-						}()
-					}
+				if _, ok := r.pool[k]; !ok {
+					continue
 				}
-			}
-			// 同步 LRU 顺序
-			if len(toClose) > 0 || len(toRestart) > 0 {
-				newOrder := r.poolOrder[:0]
-				for _, k := range r.poolOrder {
-					if _, ok := r.pool[k]; ok {
-						newOrder = append(newOrder, k)
-					}
+				if old := r.removeFromPool(k); old != nil {
+					_ = old.Close() // 确保僵尸进程清掉
 				}
-				r.poolOrder = newOrder
+				parts := strings.SplitN(k, "|", 2)
+				if len(parts) == 2 {
+					key := k
+					root, lang := parts[0], parts[1]
+					go func() {
+						ctx2, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+						defer cancel()
+						if _, err := r.LSPConn(ctx2, root, lang, true); err != nil {
+							// 重启失败: 记录并退避 (下次 reap 再试)
+							r.backoffMu.Lock()
+							r.crashBackoff[key] = time.Now().Add(r.nextBackoff(key))
+							r.backoffMu.Unlock()
+						}
+					}()
+				}
 			}
 			r.poolMu.Unlock()
 		}

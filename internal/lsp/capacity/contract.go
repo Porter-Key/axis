@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Porter-Key/axis/internal/config"
+	"github.com/Porter-Key/axis/internal/lsp/positions"
 )
 
 // LanguageID 语言标识 (与配置 adapter key 一致)。
@@ -146,6 +147,21 @@ type ProcessHandle interface {
 	PositionEncoding() string
 }
 
+// ---- 位置编码契约 (客户端列单位约定 + 各家自转码) ----
+
+// ClientCharEncoding 客户端列单位: UTF-8 字节偏移 (行内字节数)。
+// 所有 MCP 工具的 character 参数与返回位置一律按此口径 (ASCII 下与列号一致;
+// 非 ASCII 行按 UTF-8 字节计数)。服务器编码各家不同 (rust-analyzer=utf-8,
+// 其余=utf-16, 各家实测见其 provider 文件头注释), 互转由各 provider 自包含实现
+// (ServerEncoding/ToServerChar/FromServerChar/AdaptPositionsToClient),
+// 宿主与别家文件不猜任何一家的编码。
+const ClientCharEncoding = "utf-8"
+
+// ReadLine 读文件指定行 (0-based, 不含换行符), 供 AdaptPositionsToClient 按需取行文本换算列。
+// ok=false = 读不到/越界 (该位置跳过换算, 原样保留)。调用方提供带缓存的实现。
+// 定义见 positions 包, 此处别名保持契约面稳定。
+type ReadLine = positions.ReadLine
+
 // ---- Provider 接口 (契约: 系统唯一调用点) ----
 
 // Provider 一种语言的 LSP 能力提供者。
@@ -167,6 +183,22 @@ type Provider interface {
 	// DTO 映射 (该语言 LSP 返回 → 统一 DTO; 特化解析在文件内私有实现)
 	ParseLocations(raw json.RawMessage) ([]LocationDTO, error)
 	PositionParams(p PositionDTO) map[string]any
+
+	// 位置编码 (各适配器自包含: 本家服务器的真实编码 + 双向换算 + 响应适配,
+	// 全部私有实现于该文件, 不跨文件共享、不猜别家)。
+	// ServerEncoding 本家服务器的位置编码 ("utf-8"/"utf-16"), 必须与实际协商结果一致;
+	// 服务器升级编码支持时同步更新本方法 (连带 To/FromServerChar 与 AdaptPositionsToClient)。
+	ServerEncoding() string
+	// ToServerChar 客户端列 (UTF-8, 见 ClientCharEncoding) → 服务器列。lineText 为目标行文本 (调用方提供)。
+	ToServerChar(lineText string, clientChar int) int
+	// FromServerChar 服务器列 → 客户端列 (UTF-8)。lineText 为目标行文本。
+	FromServerChar(lineText string, serverChar int) int
+	// AdaptPositionsToClient 把本家服务器的位置响应换算为客户端单位后返回。
+	// 覆盖 Location/LocationLink/DocumentSymbol/SymbolInformation/WorkspaceEdit
+	// (单体与数组); 非位置响应、读不到行、越界一律原样保留 (不炸)。
+	// srcPath 为查询源文件 (DocumentSymbol 等无 uri 位置的归属; Location 类自带 uri 优先)。
+	// 行文本经 readLine 按需获取 (调用方带缓存实现)。
+	AdaptPositionsToClient(raw json.RawMessage, srcPath string, readLine ReadLine) json.RawMessage
 
 	// Signature 获取某文件位置符号的标准化签名。
 	// 实现自行决策取源与解析策略: 可用 src 发起 hover 查询, hover 不可用或

@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Porter-Key/axis/internal/lsp/langs"
 	"github.com/Porter-Key/axis/internal/logger"
 	"github.com/Porter-Key/axis/internal/lsp/capacity"
+	"github.com/Porter-Key/axis/internal/lsp/langs"
 )
 
 // ---------- 位置结果签名增强 ----------
@@ -146,13 +146,18 @@ func isFileLevelRange(sl, sc, el, ec int) bool {
 }
 
 // projectRootFor 为落点路径找项目根 (优先已注册的, 其次 marker 反查, 兜底 srcRoot)。
+// 同 ensureProject: 根约束在 srcRoot (激活项目) 边界内, 不漂到祖先目录; 新根顺手注册+监控
+// (否则该连接没有 fsmonitor, 缓存永久 stale)。
 func projectRootFor(l *LSP, path, srcRoot string) string {
-	if root, ok := l.reg.ProjectForFile(path); ok {
+	if root, ok := l.reg.ProjectForFile(path); ok && withinBoundary(root, srcRoot) {
 		return root
 	}
-	lang := langs.Detect(l.cfg, path)
+	lang := langs.Detect(l.getConfig(), path)
 	if lang != "" {
-		if root, _, ok := langs.FindProjectRoot(l.cfg, lang, path); ok {
+		if root, _, ok := langs.FindProjectRootBounded(l.getConfig(), lang, path, srcRoot); ok {
+			l.reg.RegisterProject(root)
+			l.reg.RegisterProjectLangs(root, lang)
+			l.startMonitor(root)
 			return root
 		}
 	}
@@ -196,7 +201,7 @@ type SignatureBlock struct {
 // 注入 hover 查询源 → 填宿主上下文。
 func (l *LSP) enrichSignature(ctx context.Context, root, path string, line, char int) SignatureBlock {
 	block := SignatureBlock{Source: "unavailable"}
-	lang := langs.Detect(l.cfg, path)
+	lang := langs.Detect(l.getConfig(), path)
 	if lang == "" {
 		block.Err = "无法识别语言: " + path
 		return block
@@ -243,8 +248,10 @@ type appHoverSource struct {
 
 func (s *appHoverSource) HoverMarkdown(ctx context.Context, path string, line, char int) (string, bool) {
 	logger.With("root", s.root, "lang", s.lang, "path", path).Debug("enrich hover 请求", "line", line, "char", char)
+	// 列单位: 上游给的是客户端单位 (响应已 Adapt), 这里换回服务器单位再查
+	sline, sch := s.app.toServerPos(s.lang, path, line, char)
 	res, err := s.app.reg.CallWithDoc(ctx, s.root, s.lang, "textDocument/hover", path,
-		map[string]any{"position": map[string]any{"line": line, "character": char}},
+		map[string]any{"position": map[string]any{"line": sline, "character": sch}},
 		s.app.reqTimeout(s.lang))
 	if err != nil {
 		return "", false
@@ -299,7 +306,8 @@ func shortPkg(path, root string) string {
 	return filepath.ToSlash(filepath.Dir(rel))
 }
 
-func itoa(n int) string {	if n == 0 {
+func itoa(n int) string {
+	if n == 0 {
 		return "0"
 	}
 	neg := n < 0

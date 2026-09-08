@@ -14,14 +14,14 @@ package memory
 
 // Doc 一篇笔记文档 (DB=SSOT)。
 type Doc struct {
-	Key         string `gorm:"column:key;primaryKey"`                    // 文档键 (语义名, 无扩展名, 全局唯一)
-	Title       string `gorm:"column:title"`                             // frontmatter title (结构化字段, 由 mem_field/解析维护)
-	Body        string `gorm:"column:body;type:text"`                    // md 正文 (不含 frontmatter)
-	Frontmatter string `gorm:"column:frontmatter;type:text"`             // 原始 frontmatter yaml 块 (内部 yaml 字符串)
-	Revision    int64  `gorm:"column:revision"`                          // 版本号 (每次 update 递增, 冲突/并发仲裁用)
-	ContentHash string `gorm:"column:content_hash"`                      // 正文+标题 hash (快速 diff 检测)
-	CreatedAt   int64  `gorm:"column:created_at"`                        // unix 毫秒
-	UpdatedAt   int64  `gorm:"column:updated_at"`                        // unix 毫秒
+	Key         string `gorm:"column:key;primaryKey"`        // 文档键 (语义名, 无扩展名, 全局唯一)
+	Title       string `gorm:"column:title"`                 // frontmatter title (结构化字段, 由 mem_field/解析维护)
+	Body        string `gorm:"column:body;type:text"`        // md 正文 (不含 frontmatter)
+	Frontmatter string `gorm:"column:frontmatter;type:text"` // 原始 frontmatter yaml 块 (内部 yaml 字符串)
+	Revision    int64  `gorm:"column:revision"`              // 版本号 (每次 update 递增, 冲突/并发仲裁用)
+	ContentHash string `gorm:"column:content_hash"`          // 正文+标题 hash (快速 diff 检测)
+	CreatedAt   int64  `gorm:"column:created_at"`            // unix 毫秒
+	UpdatedAt   int64  `gorm:"column:updated_at"`            // unix 毫秒
 }
 
 func (Doc) TableName() string { return "docs" }
@@ -62,19 +62,19 @@ type DocView struct {
 
 // LinkRef 链接引用视图。
 type LinkRef struct {
-	Key     string `json:"key"`
-	Type    string `json:"type"`
-	Label   string `json:"label,omitempty"`
+	Key   string `json:"key"`
+	Type  string `json:"type"`
+	Label string `json:"label,omitempty"`
 }
 
 // UpdateResult update 结果。
 type UpdateResult struct {
-	Key       string   `json:"key"`
-	Applied   bool     `json:"applied"`               // 正文是否入库
-	Revision  int64    `json:"revision,omitempty"`    // 入库后的版本
-	Warnings  []string `json:"warnings,omitempty"`    // frontmatter 忽略等警告
+	Key       string    `json:"key"`
+	Applied   bool      `json:"applied"`              // 正文是否入库
+	Revision  int64     `json:"revision,omitempty"`   // 入库后的版本
+	Warnings  []string  `json:"warnings,omitempty"`   // frontmatter 忽略等警告
 	Diff      *TextDiff `json:"diff,omitempty"`       // 与旧版正文 diff (无变化时为 nil)
-	LinkHints []string `json:"link_hints,omitempty"`  // diff 中疑似"意图连线"提示 (需 mem_link 手动连)
+	LinkHints []string  `json:"link_hints,omitempty"` // diff 中疑似"意图连线"提示 (需 mem_link 手动连)
 }
 
 // TextDiff 正文变化摘要 (行级增删统计, 不做完整 diff 输出)。

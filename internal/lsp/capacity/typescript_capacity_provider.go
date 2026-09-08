@@ -9,6 +9,7 @@ import (
 
 	"github.com/Porter-Key/axis/internal/config"
 	"github.com/Porter-Key/axis/internal/lsp/client"
+	"github.com/Porter-Key/axis/internal/lsp/positions"
 )
 
 func init() {
@@ -264,4 +265,24 @@ func tsSymbolName(sig string) string {
 		return fields[len(fields)-1]
 	}
 	return cut
+}
+
+// ---- 位置编码 (typescript: 自包含决策 + positions 成熟实现) ----
+
+// ServerEncoding typescript-language-server 的位置编码: utf-16 (tsserver 只认 utf-16)。
+func (p *typescriptProvider) ServerEncoding() string { return "utf-16" }
+
+// ToServerChar 客户端列 (UTF-8) → tsserver 列。实现见 positions。
+func (p *typescriptProvider) ToServerChar(lineText string, clientChar int) int {
+	return positions.ToServer(p.ServerEncoding(), lineText, clientChar)
+}
+
+// FromServerChar tsserver 列 → 客户端列 (UTF-8)。
+func (p *typescriptProvider) FromServerChar(lineText string, serverChar int) int {
+	return positions.FromServer(p.ServerEncoding(), lineText, serverChar)
+}
+
+// AdaptPositionsToClient tsserver 位置响应 → 客户端单位。walker 见 positions.AdaptPositions。
+func (p *typescriptProvider) AdaptPositionsToClient(raw json.RawMessage, srcPath string, readLine ReadLine) json.RawMessage {
+	return positions.AdaptPositions(raw, srcPath, p.ServerEncoding(), readLine)
 }

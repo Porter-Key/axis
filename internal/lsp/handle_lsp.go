@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,7 +39,7 @@ func (l *LSP) handleDefinition(ctx context.Context, req mcp.CallToolRequest) (*m
 	if !ok {
 		return mcpkit.ErrRes("无法定位项目根: " + path), nil
 	}
-	lang := langs.Detect(l.cfg, path)
+	lang := langs.Detect(l.getConfig(), path)
 	if lang == "" {
 		return mcpkit.ErrRes("无法识别语言: " + path), nil
 	}
@@ -64,10 +65,17 @@ func (l *LSP) handleDefinition(ctx context.Context, req mcp.CallToolRequest) (*m
 	extra := map[string]any{
 		"position": map[string]any{"line": int(line), "character": int(ch)},
 	}
+	// 请求列换算: 客户端 UTF-8 → 服务器单位 (各 provider 自转码, 无 provider 则原样)
+	{
+		sline, sch := l.toServerPos(lang, path, int(line), int(ch))
+		extra["position"] = map[string]any{"line": sline, "character": sch}
+	}
 	res, err := l.reg.CallWithDoc(ctx, root, lang, scopeInfo.method, path, extra, l.reqTimeout(lang))
 	if err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
+	// 响应列换算: 服务器单位 → 客户端 UTF-8 (再做签名增强; enrich 内 hover 会换回去)
+	res = l.adaptPositions(lang, path, res)
 	// 签名增强: 跳转落点自动附签名 (definition/implementation/typeDefinition 全覆盖)
 	res = l.attachSignaturesToLocations(ctx, root, res)
 	return mcpkit.OkJSON(res), nil
@@ -90,7 +98,7 @@ func (l *LSP) handleLSPRequest(lspMethod string) server.ToolHandlerFunc {
 		if !ok {
 			return mcpkit.ErrRes("无法定位项目根: " + path), nil
 		}
-		lang := langs.Detect(l.cfg, path)
+		lang := langs.Detect(l.getConfig(), path)
 		if lang == "" {
 			return mcpkit.ErrRes("无法识别语言: " + path), nil
 		}
@@ -98,8 +106,10 @@ func (l *LSP) handleLSPRequest(lspMethod string) server.ToolHandlerFunc {
 			"hover":      "textDocument/hover",
 			"references": "textDocument/references",
 		}[lspMethod]
+		// 请求列换算: 客户端 UTF-8 → 服务器单位
+		sline, sch := l.toServerPos(lang, path, int(line), int(ch))
 		extra := map[string]any{
-			"position": map[string]any{"line": int(line), "character": int(ch)},
+			"position": map[string]any{"line": sline, "character": sch},
 		}
 		res, err := l.reg.CallWithDoc(ctx, root, lang, method, path, extra, l.reqTimeout(lang))
 		if err != nil {
@@ -110,6 +120,8 @@ func (l *LSP) handleLSPRequest(lspMethod string) server.ToolHandlerFunc {
 		// 落点可能在第三方包/官方包 (module cache / site-packages / node_modules),
 		// LLM 看到位置后常断链失焦。这里对每个落点自动附带签名块 (用户决策: 签名是前提)。
 		if lspMethod == "references" {
+			// 响应列换算先行 (落点转为客户端单位; enrich 内 hover 会按需换回去)
+			res = l.adaptPositions(lang, path, res)
 			res = l.attachSignaturesToLocations(ctx, root, res)
 		}
 		return mcpkit.OkJSON(res), nil
@@ -129,16 +141,52 @@ func (l *LSP) handleDiagnostics(ctx context.Context, req mcp.CallToolRequest) (*
 	if !ok {
 		return mcpkit.ErrRes("无法定位项目根: " + path), nil
 	}
-	lang := langs.Detect(l.cfg, path)
+	lang := langs.Detect(l.getConfig(), path)
 	if lang == "" {
 		return mcpkit.ErrRes("无法识别语言: " + path), nil
 	}
+	// 推送语义: 先确保连接在跑, 再用一次轻查询把文档打开 (didOpen 是服务器开始推送的前提),
+	// 然后等推送最多 2s。缓存命中立刻返回。
 	conn, err := l.reg.LSPConn(ctx, root, lang, true)
 	if err != nil {
 		return mcpkit.ErrRes("LSP 启动失败: " + err.Error()), nil
 	}
 	_ = conn
-	return mcpkit.ErrRes("get_diagnostics 需 LSP 3.17 pull 支持, 阶段 C 实现"), nil
+	// 轻触发: hover(0,0) 只为 didOpen 文档 (结果丢弃; 0:0 在任何编码下都是 0:0, 无需换算)
+	_, _ = l.reg.CallWithDoc(ctx, root, lang, "textDocument/hover", path,
+		map[string]any{"position": map[string]any{"line": 0, "character": 0}}, 10*time.Second)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if raw, ok := l.reg.DiagnosticsFor(root, lang, path); ok {
+			return mcpkit.OkJSON(l.shapeDiagnostics(path, raw, true)), nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return mcpkit.ErrRes(ctx.Err().Error()), nil
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return mcpkit.OkJSON(l.shapeDiagnostics(path, nil, false)), nil
+}
+
+// shapeDiagnostics 包装诊断输出: 明确区分"服务器说没报错"与"尚无推送"(避免 agent 误判零报错)。
+func (l *LSP) shapeDiagnostics(path string, raw json.RawMessage, cached bool) map[string]any {
+	out := map[string]any{"path": path, "cached": cached, "diagnostics": []any{}, "count": 0}
+	if !cached {
+		out["note"] = "尚无该文件的推送诊断 (服务器未推送过, 不是零报错; 确保文件被查询过且服务器支持 publishDiagnostics)"
+		return out
+	}
+	var p struct {
+		Diagnostics []any `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(raw, &p); err == nil && p.Diagnostics != nil {
+		out["diagnostics"] = p.Diagnostics
+		out["count"] = len(p.Diagnostics)
+	}
+	return out
 }
 
 func (l *LSP) handleRename(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -157,14 +205,18 @@ func (l *LSP) handleRename(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	if !ok {
 		return mcpkit.ErrRes("无法定位项目根: " + path), nil
 	}
-	lang := langs.Detect(l.cfg, path)
+	lang := langs.Detect(l.getConfig(), path)
+	// 请求列换算: 客户端 UTF-8 → 服务器单位
+	sline, sch := l.toServerPos(lang, path, int(line), int(ch))
 	res, err := l.reg.CallWithDoc(ctx, root, lang, "textDocument/rename", path, map[string]any{
-		"position": map[string]any{"line": int(line), "character": int(ch)},
+		"position": map[string]any{"line": sline, "character": sch},
 		"newName":  newName,
 	}, l.reqTimeout(lang))
 	if err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
+	// 响应列换算: WorkspaceEdit 位置 → 客户端单位 (agent 按此落盘, 错位会改错地方)
+	res = l.adaptPositions(lang, path, res)
 	return mcpkit.OkJSON(res), nil
 }
 
@@ -180,8 +232,17 @@ func (l *LSP) handleSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 	// 目录 → workspace/symbol; 文件 → documentSymbol
 	if st, err := os.Stat(path); err == nil && st.IsDir() {
-		root := path
-		for lang := range l.cfg.Adapters {
+		proj, ok := l.requireProject(ctx, path)
+		if !ok {
+			return mcpkit.ErrRes("未激活项目或文件不在激活项目内: 请先 axis_activate(project)"), nil
+		}
+		// 按项目根 (而非子目录本身) 找已有连接: 连接 key 是项目根|lang,
+		// 拿子目录查池永远 miss (旧 bug)。
+		root := proj
+		if rp, ok := l.reg.ProjectForFile(path); ok && withinBoundary(rp, proj) {
+			root = rp
+		}
+		for lang := range l.getConfig().Adapters {
 			conn, err := l.reg.LSPConn(ctx, root, lang, false)
 			if err == nil && conn != nil {
 				params := map[string]any{}
@@ -192,6 +253,8 @@ func (l *LSP) handleSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				if err != nil {
 					return mcpkit.ErrRes(err.Error()), nil
 				}
+				// 响应列换算 (落点自带 uri, srcPath 仅兜底)
+				res = l.adaptPositions(lang, path, res)
 				return mcpkit.OkJSON(res), nil
 			}
 		}
@@ -201,11 +264,13 @@ func (l *LSP) handleSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if !ok {
 		return mcpkit.ErrRes("无法定位项目根: " + path), nil
 	}
-	lang := langs.Detect(l.cfg, path)
+	lang := langs.Detect(l.getConfig(), path)
 	res, err := l.reg.CallWithDoc(ctx, root, lang, "textDocument/documentSymbol", path, nil, l.reqTimeout(lang))
 	if err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
+	// 响应列换算 (同文件符号, 归属查询源文件)
+	res = l.adaptPositions(lang, path, res)
 	return mcpkit.OkJSON(res), nil
 }
 
@@ -231,25 +296,41 @@ func (l *LSP) requireProject(ctx context.Context, filePath string) (string, bool
 }
 
 // ensureProject 确保项目已注册 + fsmonitor 在跑; 返回项目根。
+// 根约束: 以当前会话激活项目为边界 (root ⊆ boundary), 已注册根与 marker 搜索一律不出界;
+// 找不到 marker 时兜底用 boundary 本身, 根永不漂出激活目录 (如激活 /a/b 不会定根到 /a)。
+// 无门禁上下文 (控制面/测试) 时退化为旧行为。
 func (l *LSP) ensureProject(ctx context.Context, filePath string) (string, bool) {
 	abs, _ := filepath.Abs(filePath)
-	if root, ok := l.reg.ProjectForFile(abs); ok {
+	boundary, _ := l.requireProject(ctx, abs)
+	if boundary == "" {
+		boundary = filepath.Dir(abs)
+	}
+	if root, ok := l.reg.ProjectForFile(abs); ok && withinBoundary(root, boundary) {
 		l.reg.TouchCall(root)
 		return root, true
 	}
-	// 未注册: 尝试按 marker 定位根并注册
-	lang := langs.Detect(l.cfg, abs)
+	// 未注册或已注册根在边界外 (他会话的祖先根): 在边界内按 marker 定位并注册
+	lang := langs.Detect(l.getConfig(), abs)
 	if lang == "" {
 		return "", false
 	}
-	root, _, ok := langs.FindProjectRoot(l.cfg, lang, abs)
+	root, _, ok := langs.FindProjectRootBounded(l.getConfig(), lang, abs, boundary)
 	if !ok {
-		root = filepath.Dir(abs) // 兜底用文件目录
+		root = boundary // 兜底用激活目录本身 (不漂移, 不建 per-dir 散根)
 	}
 	l.reg.RegisterProject(root)
 	l.reg.RegisterProjectLangs(root, lang)
 	l.startMonitor(root)
 	return root, true
+}
+
+// withinBoundary root 是否在 boundary 内 (含等于)。
+func withinBoundary(root, boundary string) bool {
+	rel, err := filepath.Rel(boundary, root)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func (l *LSP) startMonitor(root string) {
@@ -258,7 +339,7 @@ func (l *LSP) startMonitor(root string) {
 	if _, ok := l.monitors[root]; ok {
 		return
 	}
-	m, err := newMonitor(root, l.cfg.Ignore)
+	m, err := newMonitor(root, l.getConfig().Ignore)
 	if err != nil {
 		return // 监听失败不致命 (索引新鲜度降级)
 	}
@@ -275,7 +356,7 @@ var newMonitor = func(root string, ignore []string) (*fsmonitor.Monitor, error) 
 // reqTimeout 单次 LSP 请求超时: 优先 adapter.TimeoutSec, 默认 30s。
 // csharp-ls 冷启动慢 (60s 配置) → 首请求需宽限。
 func (l *LSP) reqTimeout(lang string) time.Duration {
-	if ad, ok := l.cfg.Adapters[lang]; ok && ad.TimeoutSec > 0 {
+	if ad, ok := l.getConfig().Adapters[lang]; ok && ad.TimeoutSec > 0 {
 		return time.Duration(ad.TimeoutSec) * time.Second
 	}
 	return 30 * time.Second

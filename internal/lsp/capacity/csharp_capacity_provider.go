@@ -10,6 +10,7 @@ import (
 
 	"github.com/Porter-Key/axis/internal/config"
 	"github.com/Porter-Key/axis/internal/lsp/client"
+	"github.com/Porter-Key/axis/internal/lsp/positions"
 )
 
 func init() {
@@ -319,4 +320,26 @@ func csSymbolName(sig string) string {
 		return fields[len(fields)-1]
 	}
 	return cut
+}
+
+// ---- 位置编码 (csharp: 自包含决策 + positions 成熟实现) ----
+
+// ServerEncoding csharp-ls 的位置编码: utf-16。
+// csharp-ls 未声明 positionEncodings, 按 LSP 默认 utf-16 处理。若将来实测协商出 utf-8,
+// 只改这里一处返回值, 换算与响应适配自动跟随。
+func (p *csharpProvider) ServerEncoding() string { return "utf-16" }
+
+// ToServerChar 客户端列 (UTF-8) → csharp-ls 列。实现见 positions。
+func (p *csharpProvider) ToServerChar(lineText string, clientChar int) int {
+	return positions.ToServer(p.ServerEncoding(), lineText, clientChar)
+}
+
+// FromServerChar csharp-ls 列 → 客户端列 (UTF-8)。
+func (p *csharpProvider) FromServerChar(lineText string, serverChar int) int {
+	return positions.FromServer(p.ServerEncoding(), lineText, serverChar)
+}
+
+// AdaptPositionsToClient csharp-ls 位置响应 → 客户端单位。walker 见 positions.AdaptPositions。
+func (p *csharpProvider) AdaptPositionsToClient(raw json.RawMessage, srcPath string, readLine ReadLine) json.RawMessage {
+	return positions.AdaptPositions(raw, srcPath, p.ServerEncoding(), readLine)
 }

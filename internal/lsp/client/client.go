@@ -29,13 +29,30 @@ type Conn struct {
 	stdin   io.WriteCloser
 	stdout  io.ReadCloser
 	reader  *bufio.Reader
-	mu      sync.Mutex
+	mu      sync.Mutex // 文档状态 (openDocs/dirtyAll/docVersion/lastUse), 不横跨网络等待
+	wmu     sync.Mutex // 写串行 (seq 分配 + stdin 帧), 叶子锁 (绝不反向取 mu)
 	seq     int
 	langID  string
 	command string
 	lastUse time.Time
 	root    string
 	caps    map[string]any
+
+	// 并发路由: 单读循环 + pending 表, 同连接多请求在飞 (之前 mu 横跨整轮 RPC, 慢查询堵死一切)。
+	pmu      sync.Mutex
+	pending  map[int]chan rpcResult
+	closed   bool          // readLoop 退出或 Close 后为 true (call 快速失败, 走上层自愈重启)
+	loopDone chan struct{} // readLoop 退出时关闭
+
+	// 诊断推送缓存: textDocument/publishDiagnostics 通知原文按 uri 存 (get_diagnostics 服务于此)。
+	diagMu sync.Mutex
+	diags  map[string]json.RawMessage
+
+	// stop 进程生命周期取消 (与调用方 ctx 解耦: 池化长连接不能随某次请求 ctx 取消而被杀)。
+	// Close 调用; Spawn 失败路径由 defer 兜底。
+	stop context.CancelFunc
+	// stderr 进程 stderr 环 (失败时附尾巴, 常驻成功后静默)。
+	stderr *stderrCapture
 
 	// positionEncoding 服务器使用的位置编码 (utf-16 默认; 协商后可为 utf-8/utf-32)。
 	positionEncoding string
@@ -63,9 +80,22 @@ type rpcError struct {
 }
 
 // Spawn 启动语言服务器进程并完成 initialize 握手。长连接模型: 进程常驻, 文档保持打开, 脏标记驱动同步。
+// 进程生命周期与调用方 ctx 解耦 (独立 lifeCtx): 请求取消只中断本次 spawn, 不杀池化进程;
+// spawn 全程失败由 defer 兜底回收, 不留僵尸。
 func Spawn(ctx context.Context, ad config.LangAdapter, root string, timeout time.Duration) (*Conn, error) {
-	cmd := exec.Command(ad.Command, ad.Args...)
+	lifeCtx, stop := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(lifeCtx, ad.Command, ad.Args...)
 	cmd.Dir = root
+	stderrCap := &stderrCapture{}
+	ok := false
+	defer func() {
+		if !ok {
+			stop()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		}
+	}()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -74,7 +104,7 @@ func Spawn(ctx context.Context, ad config.LangAdapter, root string, timeout time
 	if err != nil {
 		return nil, err
 	}
-	cmd.Stderr = os.Stderr // 语言服务器日志直接透出便于调试
+	cmd.Stderr = stderrCap // 进环, 不再直透 os.Stderr 刷 journal
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn %s: %w", ad.Command, err)
 	}
@@ -83,7 +113,13 @@ func Spawn(ctx context.Context, ad config.LangAdapter, root string, timeout time
 		langID: ad.LanguageID, command: ad.Command, root: root,
 		lastUse:  time.Now(),
 		openDocs: map[string]string{},
+		stop:     stop,
+		stderr:   stderrCap,
+		pending:  map[int]chan rpcResult{},
+		loopDone: make(chan struct{}),
+		diags:    map[string]json.RawMessage{},
 	}
+	go c.readLoop() // 必须在 initialize 之前启动: 响应靠它路由
 	// initialize
 	initParams := map[string]any{
 		"processId": nil,
@@ -120,12 +156,11 @@ func Spawn(ctx context.Context, ad config.LangAdapter, root string, timeout time
 	}
 	var res rpcMsg
 	if err := c.call(ctx, "initialize", initParams, &res, timeout); err != nil {
-		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("initialize %s: %w", ad.Command, err)
+		// defer 兜底 kill; 这里只附 stderr 尾巴 (之前排障抓瞎的根因)
+		return nil, fmt.Errorf("initialize %s: %w\n[%s stderr tail]\n%s", ad.Command, err, ad.Command, stderrCap.tail(2000))
 	}
 	if res.Error != nil {
-		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("initialize %s: %s", ad.Command, res.Error.Message)
+		return nil, fmt.Errorf("initialize %s: %s\n[%s stderr tail]\n%s", ad.Command, res.Error.Message, ad.Command, stderrCap.tail(2000))
 	}
 	// 解析 initialize result: 规范为 {capabilities:{...}, serverInfo:{...}},
 	// 实际 result 顶层含 capabilities 键。解出 capabilities 存 c.caps。
@@ -145,9 +180,15 @@ func Spawn(ctx context.Context, ad config.LangAdapter, root string, timeout time
 	}
 	// initialized 通知
 	if err := c.notify("initialized", map[string]any{}); err != nil {
-		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("initialized %s: %w", ad.Command, err)
+		return nil, fmt.Errorf("initialized %s: %w\n[%s stderr tail]\n%s", ad.Command, err, ad.Command, stderrCap.tail(2000))
 	}
+	// 调用方在 spawn 过程中取消 → 不泄漏进程 (defer 兜底 kill, 这里转 ctx 错误)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	ok = true
 	return c, nil
 }
 
@@ -155,14 +196,16 @@ func Spawn(ctx context.Context, ad config.LangAdapter, root string, timeout time
 //   - 首次请求该文件 → didOpen (读最新盘, 记录内容 hash, 保持打开)
 //   - 后续请求 → 若内容 hash 变更 (或 dirtyAll) → didChange 全量同步 → 请求
 //   - 不 didClose (长连接)
+//
+// 并发: 文档同步段持 c.mu (短); 实际请求经 c.call 多路并发, 不再被慢查询堵死。
 func (c *Conn) CallWithDoc(ctx context.Context, method string, filePath string, extra map[string]any, timeout time.Duration) (json.RawMessage, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.lastUse = time.Now()
 
 	uri := uriFromPath(filePath)
 	text, err := os.ReadFile(filePath)
 	if err != nil {
+		c.mu.Unlock()
 		return nil, err
 	}
 	hash := fileHash(text)
@@ -184,6 +227,7 @@ func (c *Conn) CallWithDoc(ctx context.Context, method string, filePath string, 
 			},
 		}
 		if err := c.writeMsg(method_notify, "textDocument/didOpen", didOpen); err != nil {
+			c.mu.Unlock()
 			return nil, err
 		}
 		c.openDocs[uri] = hash
@@ -199,17 +243,19 @@ func (c *Conn) CallWithDoc(ctx context.Context, method string, filePath string, 
 			},
 		}
 		if err := c.writeMsg(method_notify, "textDocument/didChange", didChange); err != nil {
+			c.mu.Unlock()
 			return nil, err
 		}
 		c.openDocs[uri] = hash
 	}
+	c.mu.Unlock() // 文档状态已定; 下方网络往返不再持锁 (多路并发)
 
 	params := map[string]any{"textDocument": map[string]any{"uri": uri}}
 	for k, v := range extra {
 		params[k] = v
 	}
 	var res rpcMsg
-	if err := c.callLocked(ctx, method, params, &res, timeout); err != nil {
+	if err := c.call(ctx, method, params, &res, timeout); err != nil {
 		return nil, err
 	}
 	if res.Error != nil {
@@ -312,10 +358,10 @@ func fileHash(b []byte) string {
 // WorkspaceRequest 发送 workspace 级请求 (如 workspace/symbol, 无需 didOpen)。
 func (c *Conn) WorkspaceRequest(ctx context.Context, method string, params map[string]any, timeout time.Duration) (json.RawMessage, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.lastUse = time.Now()
+	c.mu.Unlock()
 	var res rpcMsg
-	if err := c.callLocked(ctx, method, params, &res, timeout); err != nil {
+	if err := c.call(ctx, method, params, &res, timeout); err != nil {
 		return nil, err
 	}
 	if res.Error != nil {
@@ -325,7 +371,11 @@ func (c *Conn) WorkspaceRequest(ctx context.Context, method string, params map[s
 }
 
 // LastUse 最近使用时间 (供空闲回收判断)。
-func (c *Conn) LastUse() time.Time { return c.lastUse }
+func (c *Conn) LastUse() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastUse
+}
 
 // ProcessPID 返回子进程 PID (0 若未启动)。
 func (c *Conn) ProcessPID() int {
@@ -414,10 +464,14 @@ func (c *Conn) supportsPositionEncoding(enc string) bool {
 	return false
 }
 
-// Close 关闭进程 (发 shutdown/exit 后 kill)。
+// Close 关闭进程 (发 shutdown/exit 后 kill, 并取消生命周期 ctx)。
+// 同时失败全部在飞请求并等待读循环退出 (有界 2s, 防管道卡死)。
 func (c *Conn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.stop != nil {
+		c.stop() // 先停 lifeCtx (CommandContext 兜底, 进程必收)
+	}
 	c.writeMsgGetID(method_call, "shutdown", map[string]any{})
 	c.writeMsgGetID(method_notify, "exit", nil)
 	_ = c.stdin.Close()
@@ -425,47 +479,174 @@ func (c *Conn) Close() error {
 		_ = c.cmd.Process.Kill()
 		_, _ = c.cmd.Process.Wait()
 	}
+	c.failAllPending(fmt.Errorf("conn closed (%s %s)", c.langID, c.root))
+	if c.loopDone != nil {
+		select {
+		case <-c.loopDone:
+		case <-time.After(2 * time.Second):
+		}
+	}
 	return nil
 }
 
-// call 发送请求并读取匹配 id 的响应 (正确的 Content-Length 帧解析)。
-// 由于同进程可能并行 call (不同文件), 用 reader 锁串行化。
+// rpcResult 一次请求的路由结果 (响应或路由级错误)。
+type rpcResult struct {
+	msg *rpcMsg
+	err error
+}
+
+// call 发送请求并等待响应 (同连接可多路并发, 靠 readLoop 按 id 路由)。
+// 超时/取消后摘除 pending (迟到响应被 readLoop 丢弃); 连接已死快速失败走上层自愈。
 func (c *Conn) call(ctx context.Context, method string, params any, out *rpcMsg, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	c.mu.Lock() // 串行化所有请求 (LSP 本身单线程安全即可)
-	defer c.mu.Unlock()
-	return c.callLocked(ctx, method, params, out, timeout)
-}
-
-// callLocked 假设已持有 c.mu。
-func (c *Conn) callLocked(ctx context.Context, method string, params any, out *rpcMsg, timeout time.Duration) error {
-	id := c.writeMsgGetID(method_call, method, params)
-	if id == 0 {
-		return fmt.Errorf("write %s failed", method)
+	id := c.allocID()
+	ch := make(chan rpcResult, 1)
+	c.pmu.Lock()
+	if c.closed {
+		c.pmu.Unlock()
+		return fmt.Errorf("conn closed (%s %s)", c.langID, c.root)
 	}
-	type result struct {
-		resp *rpcMsg
-		err  error
+	c.pending[id] = ch
+	c.pmu.Unlock()
+	if err := c.writeRequest(id, method, params); err != nil {
+		c.removePending(id)
+		return fmt.Errorf("write %s failed: %w", method, err)
 	}
-	ch := make(chan result, 1)
-	go func() {
-		resp, err := c.readResponse(id)
-		ch <- result{resp, err}
-	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		c.removePending(id)
 		return ctx.Err()
-	case <-time.After(timeout):
+	case <-timer.C:
+		c.removePending(id)
 		return fmt.Errorf("request %s timeout after %v", method, timeout)
 	case r := <-ch:
 		if r.err != nil {
 			return r.err
 		}
-		*out = *r.resp
+		*out = *r.msg
 		return nil
 	}
+}
+
+// allocID 分配唯一请求 id (wmu 保护)。
+func (c *Conn) allocID() int {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.seq++
+	return c.seq
+}
+
+// writeRequest 写一条带 id 的请求帧 (字节级原子由 writeFrame 的 wmu 保证)。
+func (c *Conn) writeRequest(id int, method string, params any) error {
+	raw, _ := json.Marshal(params)
+	return c.writeFrame(rpcMsg{JSONRPC: "2.0", ID: &id, Method: method, Params: raw})
+}
+
+// removePending 摘除等待项 (超时/取消后调用; 迟到响应会被投递时丢弃)。
+func (c *Conn) removePending(id int) {
+	c.pmu.Lock()
+	defer c.pmu.Unlock()
+	delete(c.pending, id)
+}
+
+// deliver 投递响应到等待者 (readLoop 唯一调用)。无等待项 (超时已摘除) 则丢弃。
+func (c *Conn) deliver(id int, msg *rpcMsg) {
+	c.pmu.Lock()
+	ch, ok := c.pending[id]
+	if ok {
+		delete(c.pending, id)
+	}
+	c.pmu.Unlock()
+	if ok {
+		ch <- rpcResult{msg: msg}
+	}
+}
+
+// failAllPending 连接死亡时失败全部在飞请求 (readLoop 退出/Close 调用, 幂等)。
+func (c *Conn) failAllPending(err error) {
+	c.pmu.Lock()
+	defer c.pmu.Unlock()
+	c.closed = true
+	for id, ch := range c.pending {
+		delete(c.pending, id)
+		ch <- rpcResult{err: err}
+	}
+}
+
+// readLoop 单读循环 (每连接一条 goroutine, Spawn 后启动, 读到 EOF/错即退出):
+//   - 带 id 无 method = 响应 → 按 id 投递 pending (无等待项则丢弃, 如超时后迟到)
+//   - 带 id 有 method = 服务端→客户端请求 (如 workspace/configuration) → 就地应答
+//   - 纯通知 → publishDiagnostics 进缓存, 其余丢弃
+//
+// 只取 wmu (写应答帧) 与 pmu/diagMu, 永不碰 c.mu (与请求路径的 c.mu→wmu 顺序无反转)。
+func (c *Conn) readLoop() {
+	defer close(c.loopDone)
+	for {
+		msg, err := c.readMsg()
+		if err != nil {
+			c.failAllPending(fmt.Errorf("lsp read loop ended (%s %s): %w", c.langID, c.root, err))
+			return
+		}
+		if msg.ID != nil && msg.Method == "" {
+			c.deliver(*msg.ID, msg) // 真正的响应
+			continue
+		}
+		if msg.ID != nil && msg.Method != "" {
+			c.answerServerRequest(msg)
+			continue
+		}
+		// 纯通知
+		if msg.Method == "textDocument/publishDiagnostics" {
+			c.storeDiagnostics(msg.Params)
+		}
+		// 其余通知 (window/logMessage 等) 丢弃
+	}
+}
+
+// answerServerRequest 应答服务端→客户端请求 (id 可能与我们的请求 id 冲突,
+// 如 rust-analyzer 的 workspace/diagnostic/refresh 用低 id): 必须按方法应答正确结果。
+//   - client/registerCapability (动态注册, 如文件监听): 应答 {} = 成功
+//   - workspace/configuration: 应答 [] (无配置项)
+//   - window/workDoneProgress/create / workspace/diagnostic/refresh 等: null
+func (c *Conn) answerServerRequest(msg *rpcMsg) {
+	res := json.RawMessage("null")
+	switch msg.Method {
+	case "client/registerCapability":
+		res = json.RawMessage("{}")
+		logger.With("lang", c.langID, "root", c.root).Debug("server 注册动态能力", "method", msg.Method)
+	case "workspace/configuration":
+		res = json.RawMessage("[]")
+	case "workspace/workspaceFolders":
+		res = json.RawMessage("null")
+	}
+	resp := rpcMsg{JSONRPC: "2.0", ID: msg.ID, Result: res}
+	_ = c.writeFrame(resp)
+}
+
+// storeDiagnostics 缓存一条 publishDiagnostics 推送 (按 uri 覆盖)。
+func (c *Conn) storeDiagnostics(params json.RawMessage) {
+	var p struct {
+		URI string `json:"uri"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil || p.URI == "" {
+		return
+	}
+	c.diagMu.Lock()
+	defer c.diagMu.Unlock()
+	c.diags[p.URI] = params
+}
+
+// DiagnosticsFor 取某文件的推送诊断缓存 (get_diagnostics 服务于此)。
+// ok=false = 该连接尚无此文件的推送 (服务器没推过, 不是"零报错")。
+func (c *Conn) DiagnosticsFor(filePath string) (json.RawMessage, bool) {
+	c.diagMu.Lock()
+	defer c.diagMu.Unlock()
+	d, ok := c.diags[uriFromPath(filePath)]
+	return d, ok
 }
 
 // NotifyProjectChanged 主动同步项目文件磁盘变更到 LSP 服务器。fsmonitor 检测到
@@ -526,20 +707,24 @@ func (c *Conn) NotifyProjectChanged(changedPaths []string) {
 // Notify 发送 notification (无响应)。供 provider 层做语言服务器特化握手
 // (如 csharp-ls 的 solution/open、project/open)。
 func (c *Conn) Notify(method string, params any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	raw, _ := json.Marshal(params)
 	msg := rpcMsg{JSONRPC: "2.0", Method: method, Params: raw}
 	return c.writeFrame(msg)
 }
 
-// writeMsgGetID 发送请求消息, 返回分配的 id (0 失败)。
+// writeMsgGetID 发送请求/通知消息, 返回分配的 id (通知返回 0 占位, 写失败返回 0)。
+// id 分配与字节写分离 (wmu 内各自原子即可; 线上 id 乱序不影响 JSON-RPC 按 id 配对)。
 func (c *Conn) writeMsgGetID(kind msgKind, method string, params any) int {
-	c.seq++
-	id := c.seq
-	msg := rpcMsg{JSONRPC: "2.0", ID: &id, Method: method}
-	if kind == method_notify {
-		msg.ID = nil
+	id := 0
+	if kind == method_call {
+		c.wmu.Lock()
+		c.seq++
+		id = c.seq
+		c.wmu.Unlock()
+	}
+	msg := rpcMsg{JSONRPC: "2.0", Method: method}
+	if kind == method_call {
+		msg.ID = &id
 	}
 	raw, _ := json.Marshal(params)
 	msg.Params = raw
@@ -547,41 +732,6 @@ func (c *Conn) writeMsgGetID(kind msgKind, method string, params any) int {
 		return 0
 	}
 	return id
-}
-
-// readResponse 读直到 id 匹配。必须在 c.mu 下调用 (串行读)。
-// 遇服务端发来的 request (如 workspace/configuration) 自动应答, 避免服务端阻塞。
-func (c *Conn) readResponse(wantID int) (*rpcMsg, error) {
-	for {
-		msg, err := c.readMsg()
-		if err != nil {
-			return nil, err
-		}
-		if msg.ID != nil && *msg.ID == wantID && msg.Method == "" {
-			return msg, nil // 真正的响应: 有 id 无 method
-		}
-		if msg.ID != nil && msg.Method != "" {
-			// 服务端 → 客户端 request (id 可能与我们的请求 id 冲突, 如 rust-analyzer 的
-			// workspace/diagnostic/refresh 用低 id): 必须按方法应答正确结果, 不能当响应返回。
-			//   - client/registerCapability (动态注册, 如文件监听): 应答 {} = 成功
-			//   - workspace/configuration: 应答 [] (无配置项)
-			//   - window/workDoneProgress/create / workspace/diagnostic/refresh 等: null
-			res := json.RawMessage("null")
-			switch msg.Method {
-			case "client/registerCapability":
-				res = json.RawMessage("{}")
-				logger.With("lang", c.langID, "root", c.root).Debug("server 注册动态能力", "method", msg.Method)
-			case "workspace/configuration":
-				res = json.RawMessage("[]")
-			case "workspace/workspaceFolders":
-				res = json.RawMessage("null")
-			}
-			resp := rpcMsg{JSONRPC: "2.0", ID: msg.ID, Result: res}
-			_ = c.writeFrame(resp)
-			continue
-		}
-		// 忽略纯通知
-	}
 }
 
 // readMsg 读一条完整的 Content-Length 帧。
@@ -616,8 +766,6 @@ func (c *Conn) readMsg() (*rpcMsg, error) {
 }
 
 func (c *Conn) notify(method string, params any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.writeMsgGetID(method_notify, method, params)
 	return nil
 }
@@ -639,8 +787,10 @@ func (c *Conn) writeMsg(kind msgKind, method string, params any) error {
 	return nil
 }
 
-// writeFrame 写一条 Content-Length 帧。
+// writeFrame 写一条 Content-Length 帧 (wmu 保证字节级原子, 多路并发安全)。
 func (c *Conn) writeFrame(msg rpcMsg) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err

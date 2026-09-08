@@ -18,9 +18,9 @@ var (
 
 // Config 日志配置。
 type Config struct {
-	Path  string `json:"path,omitempty" yaml:"path,omitempty"`    // JSONL 文件路径; 空 = stderr
-	Level string `json:"level,omitempty" yaml:"level,omitempty"`  // debug|info|warn|error (默认 info)
-	Also  bool   `json:"also,omitempty" yaml:"also,omitempty"`    // true = 同时输出 stderr
+	Path  string `json:"path,omitempty" yaml:"path,omitempty"`   // JSONL 文件路径; 空 = stderr
+	Level string `json:"level,omitempty" yaml:"level,omitempty"` // debug|info|warn|error (默认 info)
+	Also  bool   `json:"also,omitempty" yaml:"also,omitempty"`   // true = 同时输出 stderr
 }
 
 // DefaultPath 默认 JSONL 路径 (用户级, systemd User=porter 可写)。

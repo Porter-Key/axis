@@ -38,10 +38,10 @@ func (p *Plugin) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if q == "" {
 		return mcpkit.ErrRes("query 必填"), nil
 	}
-	if err := p.cg.EnsureIndex(root); err != nil {
+	if err := p.cg.Load().EnsureIndex(root); err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
-	out, err := p.cg.Explore(ctx, root, strings.Fields(q))
+	out, err := p.cg.Load().Explore(ctx, root, strings.Fields(q))
 	if err != nil {
 		return mcpkit.ErrRes(err.Error()), nil
 	}
@@ -59,7 +59,7 @@ func (p *Plugin) handleJSON(kind string) server.ToolHandlerFunc {
 		if !p.requireRoot(ctx, root) {
 			return mcpkit.ErrRes("root 与激活项目不符或未激活: 请先 axis_activate(project)"), nil
 		}
-		if err := p.cg.EnsureIndex(root); err != nil {
+		if err := p.cg.Load().EnsureIndex(root); err != nil {
 			return mcpkit.ErrRes(err.Error()), nil
 		}
 		var res json.RawMessage
@@ -68,18 +68,18 @@ func (p *Plugin) handleJSON(kind string) server.ToolHandlerFunc {
 		case "query":
 			q, _ := args["query"].(string)
 			kindF, _ := args["kind"].(string)
-			res, err = p.cg.Query(ctx, root, q, kindF, 20)
+			res, err = p.cg.Load().Query(ctx, root, q, kindF, 20)
 		case "callers":
 			s, _ := args["symbol"].(string)
-			res, err = p.cg.Callers(ctx, root, s)
+			res, err = p.cg.Load().Callers(ctx, root, s)
 		case "callees":
 			s, _ := args["symbol"].(string)
-			res, err = p.cg.Callees(ctx, root, s)
+			res, err = p.cg.Load().Callees(ctx, root, s)
 		case "impact":
 			s, _ := args["symbol"].(string)
-			res, err = p.cg.Impact(ctx, root, s)
+			res, err = p.cg.Load().Impact(ctx, root, s)
 		case "status":
-			res, err = p.cg.Status(ctx, root)
+			res, err = p.cg.Load().Status(ctx, root)
 		}
 		if err != nil {
 			return mcpkit.ErrRes(err.Error()), nil
@@ -99,10 +99,10 @@ func (p *Plugin) handleText(cmd string) server.ToolHandlerFunc {
 		if !p.requireRoot(ctx, root) {
 			return mcpkit.ErrRes("root 与激活项目不符或未激活: 请先 axis_activate(project)"), nil
 		}
-		if err := p.cg.EnsureIndex(root); err != nil {
+		if err := p.cg.Load().EnsureIndex(root); err != nil {
 			return mcpkit.ErrRes(err.Error()), nil
 		}
-		out, err := p.cg.RunText(ctx, root, cmd)
+		out, err := p.cg.Load().RunText(ctx, root, cmd)
 		if err != nil {
 			return mcpkit.ErrRes(err.Error()), nil
 		}

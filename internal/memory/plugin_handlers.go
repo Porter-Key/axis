@@ -154,8 +154,8 @@ func (p *Plugin) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mc
 	return mcpkit.OkJSON(map[string]any{
 		"key": key, "exists": true,
 		"revision": v.Revision, "title": v.Title,
-		"updated_at": v.UpdatedAt,
+		"updated_at":  v.UpdatedAt,
 		"export_path": svc.ExportPath(key),
-		"fields": v.Fields, "out_links": v.OutLinks, "in_links": v.InLinks,
+		"fields":      v.Fields, "out_links": v.OutLinks, "in_links": v.InLinks,
 	}), nil
 }

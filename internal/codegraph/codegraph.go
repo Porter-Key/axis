@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Porter-Key/axis/internal/config"
@@ -51,8 +52,6 @@ func (c *Client) EnsureIndex(projectRoot string) error {
 	_, err := c.run(context.Background(), projectRoot, nil, "init", projectRoot)
 	return err
 }
-
-func ctxTODO() context.Context { return context.Background() }
 
 // Query 符号搜索 (JSON 输出)。kind 可为 ""。
 func (c *Client) Query(ctx context.Context, projectRoot, query, kind string, limit int) (json.RawMessage, error) {
@@ -122,25 +121,29 @@ func (c *Client) Sync(ctx context.Context, projectRoot string) error {
 	return err
 }
 
-// LastChangeIsNewer 由外部 (fsmonitor) 提供是否需 sync; 内部记录上次 sync 时间。
-func (c *Client) LastSyncAt(projectRoot string) time.Time {
-	if t, ok := lastSync[projectRoot]; ok {
-		return t
-	}
-	return time.Time{}
-}
-func (c *Client) MarkSynced(projectRoot string) {
-	lastSync[projectRoot] = time.Now()
-}
+// syncFreshWindow 同项目两次 sync 的最小间隔: 窗口内查询直接跳过 sync。
+// (fsmonitor 只在真有变更时才需要同步, 且 CLI 自身 watcher 也会自动跟进;
+// 之前每次查询 fork sync+query 两个进程, 高频调用下是纯浪费。)
+const syncFreshWindow = 10 * time.Second
 
-var lastSync = map[string]time.Time{}
+// syncFlights 进程级 sync 单飞 + 新鲜度记录 (替代之前无锁的 lastSync map, 有 race)。
+var syncFlights = struct {
+	sync.Mutex
+	calls map[string]*syncCall
+	last  map[string]time.Time
+}{calls: map[string]*syncCall{}, last: map[string]time.Time{}}
+
+type syncCall struct {
+	done chan struct{}
+	err  error
+}
 
 // ConfigForTest 供测试构建 Client。
 func ConfigForTest() config.CodegraphConfig {
 	return config.CodegraphConfig{Bin: "codegraph", AutoInit: false, SyncOnChange: false, TimeoutSec: 60}
 }
 
-// syncGate: 若项目刚 sync 过 (本进程内) 则跳过; 否则每次查询前 sync (幂等, 增量快)。
+// syncGate 查询前同步门: 新鲜窗口内跳过; 并发查询同项目只放一个去 sync, 其余等结果。
 func (c *Client) syncGate(ctx context.Context, projectRoot string) error {
 	if !c.syncOnChg {
 		return nil
@@ -148,13 +151,36 @@ func (c *Client) syncGate(ctx context.Context, projectRoot string) error {
 	if !c.HasIndex(projectRoot) {
 		return c.EnsureIndex(projectRoot)
 	}
-	// codegraph CLI 的 sync 是增量的 (自身 watcher 也自动), 这里保守每次查询前跑一次
-	// 代价: 增量 sync 毫秒级 (无变更时 fast path)。
-	if err := c.Sync(ctx, projectRoot); err != nil {
-		return fmt.Errorf("codegraph sync: %w", err)
+	syncFlights.Lock()
+	if t, ok := syncFlights.last[projectRoot]; ok && time.Since(t) < syncFreshWindow {
+		syncFlights.Unlock()
+		return nil // 10s 内刚同步过: 跳过
 	}
-	c.MarkSynced(projectRoot)
-	return nil
+	if cl, ok := syncFlights.calls[projectRoot]; ok {
+		syncFlights.Unlock()
+		select {
+		case <-cl.done:
+			return cl.err // 搭同项目的顺风车
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	cl := &syncCall{done: make(chan struct{})}
+	syncFlights.calls[projectRoot] = cl
+	syncFlights.Unlock()
+
+	err := c.Sync(ctx, projectRoot)
+	syncFlights.Lock()
+	delete(syncFlights.calls, projectRoot)
+	if err != nil {
+		err = fmt.Errorf("codegraph sync: %w", err)
+	} else {
+		syncFlights.last[projectRoot] = time.Now()
+	}
+	cl.err = err
+	close(cl.done)
+	syncFlights.Unlock()
+	return err
 }
 
 // runJSON 执行并解析 JSON 输出。
@@ -166,8 +192,12 @@ func (c *Client) runJSON(ctx context.Context, projectRoot string, args ...string
 	if err != nil {
 		return nil, err
 	}
-	// 容忍前置警告行: 找第一个 '{' 开始
-	idx := strings.IndexByte(out, '{')
+	// 容忍前置警告行: 找第一个 '{' 或 '[' 开始 (空结果常为 [], 之前只认 '{' 会误报)。
+	idxObj, idxArr := strings.IndexByte(out, '{'), strings.IndexByte(out, '[')
+	idx := idxObj
+	if idx < 0 || (idxArr >= 0 && idxArr < idx) {
+		idx = idxArr
+	}
 	if idx < 0 {
 		return nil, fmt.Errorf("codegraph 输出非 JSON: %s", truncate(out, 200))
 	}

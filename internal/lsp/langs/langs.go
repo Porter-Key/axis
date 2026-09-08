@@ -59,11 +59,19 @@ func Detect(cfg *config.Config, path string) string {
 // FindProjectRoot 从文件路径向上回溯找项目根 (含任一 marker 的目录)。
 // 返回根目录与找到的 marker。找不到返回 false。
 func FindProjectRoot(cfg *config.Config, lang, filePath string) (root string, marker string, ok bool) {
-	dir := filepath.Dir(filePath)
+	return FindProjectRootBounded(cfg, lang, filePath, "")
+}
+
+// FindProjectRootBounded 同 FindProjectRoot, 但上行搜索止于 stopDir (含 stopDir 本身,
+// 即 stopDir 下的 marker 仍然有效)。stopDir 为 "" 时不限界。
+// 用途: 把 LSP 项目根约束在激活项目内, 防止漂到祖先目录 (如激活 /a/b 却定根到 /a)。
+func FindProjectRootBounded(cfg *config.Config, lang, filePath, stopDir string) (root string, marker string, ok bool) {
+	dir := filepath.Dir(filepath.Clean(filePath))
 	ad, exists := cfg.Adapters[lang]
 	if !exists {
 		return "", "", false
 	}
+	stopDir = filepath.Clean(stopDir)
 	for {
 		for _, m := range ad.Markers {
 			// marker 支持 glob (如 *.csproj), 需目录扫描
@@ -79,6 +87,9 @@ func FindProjectRoot(cfg *config.Config, lang, filePath string) (root string, ma
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			break
+		}
+		if stopDir != "" && dir == stopDir {
+			break // 到激活边界为止 (本层 marker 已查过)
 		}
 		dir = parent
 	}

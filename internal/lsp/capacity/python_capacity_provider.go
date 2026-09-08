@@ -9,6 +9,7 @@ import (
 
 	"github.com/Porter-Key/axis/internal/config"
 	"github.com/Porter-Key/axis/internal/lsp/client"
+	"github.com/Porter-Key/axis/internal/lsp/positions"
 )
 
 func init() {
@@ -278,4 +279,24 @@ func pythonSymbolName(sig string) string {
 		s = s[:i]
 	}
 	return strings.TrimSpace(s)
+}
+
+// ---- 位置编码 (python: 自包含决策 + positions 成熟实现) ----
+
+// ServerEncoding pyright 的位置编码: utf-16 (LSP 默认, pyright 不声明 utf-8)。
+func (p *pythonProvider) ServerEncoding() string { return "utf-16" }
+
+// ToServerChar 客户端列 (UTF-8) → pyright 列。实现见 positions。
+func (p *pythonProvider) ToServerChar(lineText string, clientChar int) int {
+	return positions.ToServer(p.ServerEncoding(), lineText, clientChar)
+}
+
+// FromServerChar pyright 列 → 客户端列 (UTF-8)。
+func (p *pythonProvider) FromServerChar(lineText string, serverChar int) int {
+	return positions.FromServer(p.ServerEncoding(), lineText, serverChar)
+}
+
+// AdaptPositionsToClient pyright 位置响应 → 客户端单位。walker 见 positions.AdaptPositions。
+func (p *pythonProvider) AdaptPositionsToClient(raw json.RawMessage, srcPath string, readLine ReadLine) json.RawMessage {
+	return positions.AdaptPositions(raw, srcPath, p.ServerEncoding(), readLine)
 }

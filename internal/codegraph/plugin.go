@@ -5,6 +5,7 @@ package codegraph
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -15,18 +16,27 @@ import (
 
 // Plugin codegraph 插件实例。
 type Plugin struct {
-	cfg config.CodegraphConfig
-	cg  *Client
+	// cg 热重载可换指针: atomic (handler 并发读, SetConfig 并发写)。
+	cg   atomic.Pointer[Client]
 	gate *plugin.Gate
 }
 
 // New 构建 codegraph 插件。
 func NewPlugin(cfg config.CodegraphConfig) *Plugin {
-	return &Plugin{cfg: cfg, cg: New(cfg)}
+	p := &Plugin{}
+	p.cg.Store(New(cfg))
+	return p
 }
 
 // Name 插件名。
 func (p *Plugin) Name() string { return "codegraph" }
+
+// SetConfig 热更新配置 (ctrlReload 路径): 原地重建 Client。
+// handler 全部经 atomic Load 取当前 Client, 无需重注册;
+// Client 无后台资源, 旧实例无需 Shutdown (在飞查询用旧实例跑完, 无中间状态)。
+func (p *Plugin) SetConfig(cfg config.CodegraphConfig) {
+	p.cg.Store(New(cfg))
+}
 
 // SetGate 注入会话门禁 (axis 壳调用)。
 func (p *Plugin) SetGate(g *plugin.Gate) { p.gate = g }
