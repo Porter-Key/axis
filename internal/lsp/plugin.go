@@ -73,7 +73,7 @@ func (l *LSP) SetConfig(cfg *config.Config) {
 // Register 注册 LSP 工具。
 func (l *LSP) Register(ms *server.MCPServer) {
 	ms.AddTool(mcp.NewTool("get_definition",
-		mcp.WithDescription("返回文件某位置符号的定义位置。scope 可选: definition(默认)|implementation|typeDefinition, 按语言服务器能力降级。"),
+		mcp.WithDescription("精确查定义（LSP 类型级：校验 codegraph 结论的金标准）。scope 可选: definition(默认)|implementation|typeDefinition, 按语言服务器能力降级。"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径")),
 		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
 		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
@@ -81,26 +81,26 @@ func (l *LSP) Register(ms *server.MCPServer) {
 	), l.handleDefinition)
 
 	ms.AddTool(mcp.NewTool("get_hover",
-		mcp.WithDescription("返回文件某位置的悬停信息 (类型/文档)。"),
+		mcp.WithDescription("精确查悬停签名/文档（LSP 类型级：读不懂的符号先看这里，再决定跟 definition）。"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径")),
 		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
 		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
 	), l.handleLSPRequest("hover"))
 
 	ms.AddTool(mcp.NewTool("get_references",
-		mcp.WithDescription("返回符号在项目内的全部引用位置 (落点附签名块)。"),
+		mcp.WithDescription("精确查全部引用（LSP 类型级）。codegraph find_callers 可能漏边，动手改代码以本工具为准。"),
 		mcp.WithString("path", mcp.Required()),
 		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
 		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
 	), l.handleLSPRequest("references"))
 
 	ms.AddTool(mcp.NewTool("get_diagnostics",
-		mcp.WithDescription("返回文件当前全部诊断 (编译错误/警告)。"),
+		mcp.WithDescription("文件诊断（LSP 推送语义：返回服务器已推送的诊断，需文件被查询打开过；cached=false 表示尚无推送≠零报错）。"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件绝对路径 (可目录)")),
 	), l.handleDiagnostics)
 
 	ms.AddTool(mcp.NewTool("get_rename",
-		mcp.WithDescription("计算符号重命名的影响范围 (编辑点列表)。"),
+		mcp.WithDescription("精确算重命名编辑点（LSP，只计算不应用；改名前先用它拿全量清单）。"),
 		mcp.WithString("path", mcp.Required()),
 		mcp.WithNumber("line", mcp.Required(), mcp.Description("行号 (0-based)")),
 		mcp.WithNumber("character", mcp.Required(), mcp.Description("列号 (0-based, UTF-8 字节偏移)")),
@@ -108,7 +108,7 @@ func (l *LSP) Register(ms *server.MCPServer) {
 	), l.handleRename)
 
 	ms.AddTool(mcp.NewTool("get_symbols",
-		mcp.WithDescription("列出文件/工作区符号。path 为文件则文件内符号, 为目录则 workspace/symbol。"),
+		mcp.WithDescription("精确列符号（LSP）：文件内符号一览，或目录 workspace 符号（需项目已建索引/服务器已启动）。定位前先用它拿新鲜行号。"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件或目录绝对路径")),
 		mcp.WithString("query", mcp.Description("符号搜索词 (workspace 模式)")),
 	), l.handleSymbols)

@@ -44,32 +44,32 @@ func (p *Plugin) SetGate(g *plugin.Gate) { p.gate = g }
 // Register 注册 codegraph 工具。
 func (p *Plugin) Register(ms *server.MCPServer) {
 	ms.AddTool(mcp.NewTool("explore_code",
-		mcp.WithDescription("codegraph 粗探索: 输入任务描述, 返回相关符号源码+调用路径 (一次一文件视角)。"),
+		mcp.WithDescription("陌生代码第一步（粗）：输入任务描述，一次返回相关符号源码+调用路径。精确落点再用 LSP 工具（get_definition/get_references）。"),
 		mcp.WithString("root", mcp.Required(), mcp.Description("项目根 (绝对路径)")),
 		mcp.WithString("query", mcp.Required(), mcp.Description("探索目标描述或符号名")),
 	), p.handleExplore)
 
 	ms.AddTool(mcp.NewTool("query_symbols",
-		mcp.WithDescription("codegraph 符号搜索 (模糊, JSON)。"),
+		mcp.WithDescription("模糊搜符号（只记得名字片段/冷启动时用）。精确引用关系走 LSP get_references。"),
 		mcp.WithString("root", mcp.Required()),
 		mcp.WithString("query", mcp.Required()),
 		mcp.WithString("kind", mcp.Description("过滤类型 function/class/...")),
 	), p.handleJSON("query"))
 
 	ms.AddTool(mcp.NewTool("find_callers",
-		mcp.WithDescription("找出所有调用某符号的调用方。"),
+		mcp.WithDescription("找调用方（粗召回：启发式图谱，局部变量/测试里的调用可能漏边）。动手改代码前用 LSP get_references 交叉验证。"),
 		mcp.WithString("root", mcp.Required()),
 		mcp.WithString("symbol", mcp.Required()),
 	), p.handleJSON("callers"))
 
 	ms.AddTool(mcp.NewTool("find_callees",
-		mcp.WithDescription("找出某符号调用的全部下游。"),
+		mcp.WithDescription("找下游调用（粗召回，同 find_callers 的漏边说明）。精确校验走 LSP get_definition 逐点确认。"),
 		mcp.WithString("root", mcp.Required()),
 		mcp.WithString("symbol", mcp.Required()),
 	), p.handleJSON("callees"))
 
 	ms.AddTool(mcp.NewTool("analyze_impact",
-		mcp.WithDescription("分析改动某符号会影响哪些代码 (blast radius)。"),
+		mcp.WithDescription("改动影响面粗筛（blast radius 初筛，可能含噪/漏边）。精确编辑点用 LSP get_references/get_rename 复核。"),
 		mcp.WithString("root", mcp.Required()),
 		mcp.WithString("symbol", mcp.Required()),
 	), p.handleJSON("impact"))
