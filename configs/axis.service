@@ -1,0 +1,37 @@
+# axis systemd service (example)
+# -------------------------------
+# Install:
+#   sudo cp configs/axis.service /etc/systemd/system/axis.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now axis
+#
+# Customize BEFORE installing:
+#   - ExecStart binary path -> wherever you put the built `axis` binary
+#   - User -> the unprivileged user that owns your projects
+#   - PATH -> must include the dirs of every LSP binary you configured
+#     in configs/axis.yaml (this example uses bare command names)
+#
+# All LSP child processes share this unit's cgroup, so `systemctl stop`
+# physically reaps them - no orphans left behind.
+
+[Unit]
+Description=axis: multi-language LSP semantic tools + codegraph graph + memory knowledge base MCP server
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/opt/axis
+ExecStart=/opt/axis/axis -http -addr 127.0.0.1:1940 -config /opt/axis/configs/axis.yaml
+# Make sure every LSP server in configs/axis.yaml is reachable via PATH here
+# (adjust to your toolchain locations: mise/rustup/dotnet/npm/uv/...)
+Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+Restart=on-failure
+RestartSec=3
+# LSP child processes are reaped together with this service
+KillMode=control-group
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

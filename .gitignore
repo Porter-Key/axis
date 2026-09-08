@@ -1,0 +1,20 @@
+# Build artifact
+/axis
+
+# Local project memory & notes (per-project knowledge base; not for publishing)
+.axis/
+
+# codegraph local index (see .codegraph/.gitignore)
+.codegraph/
+
+# Logs
+*.log
+*.jsonl
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Test artifacts
+*.out

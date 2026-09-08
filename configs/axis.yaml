@@ -1,0 +1,115 @@
+# axis configuration example
+# ==========================
+# Default search path: ./configs/axis.yaml -> ./axis.yaml -> ~/.config/mcp/axis/config.yaml
+# (or use `-config /path/to/axis.yaml`). Fields here OVERRIDE built-in defaults;
+# an empty config file is also valid (built-in defaults use bare command names
+# resolved via PATH).
+#
+# The single source of truth is this YAML file. LSP server commands may be
+# absolute paths (recommended when running under systemd with a restricted
+# environment) or bare names resolved through PATH.
+
+adapters:
+  go:
+    language_id: go
+    command: /usr/local/bin/gopls            # or bare: gopls
+    file_patterns: ["**/*.go"]
+    markers: [go.mod, go.work]
+  rust:
+    language_id: rust
+    command: /usr/local/bin/rust-analyzer
+    file_patterns: ["**/*.rs"]
+    markers: [Cargo.toml]
+  csharp:
+    language_id: csharp
+    command: /usr/local/bin/csharp-ls
+    timeout_sec: 60                          # per-language request timeout
+    file_patterns: ["**/*.cs"]
+    markers: ["*.csproj", "*.sln"]
+  python:
+    language_id: python
+    command: /usr/local/bin/pyright-langserver
+    args: ["--stdio"]
+    file_patterns: ["**/*.py"]
+    markers: [pyproject.toml, requirements.txt, setup.py]
+  typescript:
+    language_id: typescript
+    command: /usr/local/bin/typescript-language-server
+    args: ["--stdio"]
+    file_patterns: ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"]
+    markers: [tsconfig.json]
+  javascript:
+    language_id: javascript
+    command: /usr/local/bin/typescript-language-server
+    args: ["--stdio"]
+    file_patterns: ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"]
+    markers: [package.json]
+  # Add custom languages the same way; any language_id key registered here
+  # becomes available without code changes.
+
+# Session heartbeat (clients that register via /ctrl/register stay alive
+# while they heartbeat; stale sessions are reaped after timeout_sec).
+heartbeat:
+  timeout_sec: 60
+  interval_sec: 15
+
+# LSP server pool lifecycle
+pool:
+  idle_ttl_sec: 900       # idle server reaped after N seconds
+  max_servers: 6          # LRU upper bound of concurrently spawned servers
+  memory_limit_mb: 1024   # RSS watchdog: if pool RSS exceeds this, reap idle first
+
+# codegraph coarse-exploration CLI integration
+codegraph:
+  bin: codegraph          # path to the codegraph binary
+  auto_init: false        # auto-run `codegraph init` when an index is missing
+  sync_on_change: true    # trigger incremental index sync on file change
+  timeout_sec: 120
+
+# Project-level ignore rules shared by fsmonitor and codegraph
+# (directory/file names matched exactly on base name; * allowed as suffix glob)
+ignore:
+  - .git
+  - .hg
+  - .svn
+  - node_modules
+  - target
+  - .venv
+  - venv
+  - .codegraph
+  - dist
+  - build
+  - vendor
+  - .cache
+  - __pycache__
+  - .pytest_cache
+  - .mypy_cache
+  - bin
+  - obj
+  - .vs
+  - packages
+  - .idea
+  - .vscode
+  - "*.min.js"
+  - "*.min.css"
+  - "*.map"
+  - .DS_Store
+  - "*.pyc"
+
+# memory plugin (project-scoped notes/knowledge base)
+# Defaults (leave empty to use): DB at ~/.local/state/axis/memdb/<project>.db,
+# markdown export into <project>/.axis/<category>/<name>.md
+memory:
+  # db_path: /var/lib/axis/memory.db      # single-DB alternative
+  # export_dir: /var/lib/axis/memory      # md export base
+  # extension: md
+
+# Structured JSONL logging
+log:
+  # path: /var/log/axis/server.jsonl
+  level: info
+  also: false
+
+# Shared secret for /ctrl/* endpoints when exposed beyond loopback.
+# Leave empty when bound to 127.0.0.1 only.
+# ctrl_token: change-me
