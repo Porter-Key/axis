@@ -591,7 +591,8 @@ func (p *goProvider) ExploreSymbol(ctx context.Context, src WorkflowSource, path
 // VerifyChain 修改后验证: 文件诊断 + go 构建/测试提示 (build/test 由 agent 跑)。
 func (p *goProvider) VerifyChain(ctx context.Context, src WorkflowSource, path string) (map[string]any, error) {
 	out := map[string]any{"tool": "verify_chain", "language": "go", "path": path,
-		"buildHint": "go build ./...", "testHint": "go test " + goPkgDir(path) + "/..."}
+		"buildHint": "go build ./...", "testHint": "go test ./...",
+		"packageDir": goPkgDir(path)}
 	if diag, ok := src.Diagnostics(ctx, path); ok {
 		out["diagnostics"] = map[string]any{"cached": true, "count": diag["count"], "items": goDiagItems(diag, 20)}
 	} else {
