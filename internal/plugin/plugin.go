@@ -9,11 +9,15 @@ package plugin
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/Porter-Key/axis/internal/logger"
 )
 
 // GateSetter 插件可选实现: 接收会话门禁 (目录级工具激活检查用)。
@@ -56,9 +60,11 @@ type gateEntry struct {
 // defaultGateTTL 默认绑定 TTL (App 会用 Heartbeat.TimeoutSec 覆盖, 与 registry 会话回收同口径)。
 const defaultGateTTL = 24 * time.Hour
 
-// NewGate 建空门禁。
+// NewGate 建空门禁 (启动时尝试从落盘恢复历史绑定, 过期与否由 lookup 惰性判定)。
 func NewGate() *Gate {
-	return &Gate{proj: map[string]gateEntry{}, ttl: defaultGateTTL}
+	g := &Gate{proj: map[string]gateEntry{}, ttl: defaultGateTTL}
+	g.load()
+	return g
 }
 
 // SetTTL 覆盖绑定 TTL (<=0 = 不过期, 仅测试用; 线上必须由 App 传入心跳超时)。
@@ -85,14 +91,18 @@ func (g *Gate) Activate(sessionID, project string) {
 			}
 		}
 	}
+	snap := g.snapshotLocked()
 	g.mu.Unlock()
+	g.persist(snap)
 }
 
 // Deactivate 解绑 (会话结束/显式释放)。
 func (g *Gate) Deactivate(sessionID string) {
 	g.mu.Lock()
 	delete(g.proj, sessionID)
+	snap := g.snapshotLocked()
 	g.mu.Unlock()
+	g.persist(snap)
 }
 
 // ProjectFor 取 ctx 会话的激活项目。从 mcp-go context 取 ClientSession.SessionID。
@@ -144,4 +154,128 @@ func SessionIDFromContext(ctx context.Context) string {
 		return s.SessionID()
 	}
 	return ""
+}
+
+// ---------- 会话落盘恢复 (重启不掉“上次去哪了”) ----------
+
+// gateStatePath 落盘路径 (与 memory 同口径: XDG_STATE_HOME 或 ~/.local/state/axis/)。
+func gateStatePath() string {
+	base := os.Getenv("XDG_STATE_HOME")
+	if base == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			base = filepath.Join(h, ".local", "state")
+		}
+	}
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "axis", "gate.json")
+}
+
+// gateSnapshot 落盘形状 (lastSeen 用 unix 纳秒, 同秒多激活可比先后)。
+type gateSnapshot struct {
+	SavedAt  int64                    `json:"saved_at"`
+	Sessions map[string]gateEntryJSON `json:"sessions"`
+}
+
+// gateEntryJSON 单条绑定的落盘形态 (具名防匿名结构标签漂移)。
+type gateEntryJSON struct {
+	Project  string `json:"project"`
+	LastSeen int64  `json:"last_seen_nano"`
+}
+
+// snapshotLocked 当前全表快照 (调用方须持有至少读锁)。
+func (g *Gate) snapshotLocked() gateSnapshot {
+	snap := gateSnapshot{SavedAt: time.Now().Unix(), Sessions: map[string]gateEntryJSON{}}
+	for sid, e := range g.proj {
+		snap.Sessions[sid] = gateEntryJSON{Project: e.project, LastSeen: e.lastSeen.UnixNano()}
+	}
+	return snap
+}
+
+// persist 原子落盘 (tmp+rename; 失败只记日志, 不影响内存门禁)。
+func (g *Gate) persist(snap gateSnapshot) {
+	path := gateStatePath()
+	if path == "" {
+		return
+	}
+	b, err := json.Marshal(snap)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		logger.With().Warn("gate 落盘建目录失败", "error", err.Error())
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		logger.With().Warn("gate 落盘写失败", "error", err.Error())
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		logger.With().Warn("gate 落盘提交失败", "error", err.Error())
+	}
+}
+
+// load 启动恢复 (解析失败/无文件=空门禁; 过期与否由 lookup 惰性判定, 这里全留)。
+func (g *Gate) load() {
+	path := gateStatePath()
+	if path == "" {
+		return
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var snap gateSnapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
+		logger.With().Warn("gate 恢复解析失败 (用空门禁)", "error", err.Error())
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := 0
+	for sid, e := range snap.Sessions {
+		if sid == "" || e.Project == "" {
+			continue
+		}
+		g.proj[sid] = gateEntry{project: e.Project, lastSeen: time.Unix(0, e.LastSeen)}
+		n++
+	}
+	if n > 0 {
+		logger.With().Debug("gate 恢复历史绑定", "count", n)
+	}
+}
+
+// RecoveryHint 上次活跃项目提示 (落盘恢复的用途: sessionID 重启后会变,
+// 严格绑定无法自动恢复, 但拒绝时给出精确恢复命令, agent 一调即回)。
+// 无历史 → ""。nil 接收者安全。
+func (g *Gate) RecoveryHint() string {
+	if g == nil {
+		return ""
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	var best string
+	var bestSeen time.Time
+	for _, e := range g.proj {
+		if e.project == "" {
+			continue
+		}
+		if best == "" || e.lastSeen.After(bestSeen) {
+			best, bestSeen = e.project, e.lastSeen
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	return "上次激活的项目是 " + best + "；调 axis_activate(project=" + best + ") 恢复绑定"
+}
+
+// RejectMsg 拒绝消息组装: detail + 恢复提示 (nil 接收者安全)。
+func (g *Gate) RejectMsg(detail string) string {
+	if h := g.RecoveryHint(); h != "" {
+		return detail + "。" + h
+	}
+	return detail
 }

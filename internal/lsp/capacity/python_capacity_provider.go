@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -400,6 +401,8 @@ func (p *pythonProvider) BlastRadius(ctx context.Context, src WorkflowSource, pa
 					nontest = append(nontest, e)
 				}
 			}
+			pythonSortRefs(path, test)
+			pythonSortRefs(path, nontest)
 			out["references"] = map[string]any{
 				"total": len(locs), "testCount": len(test), "nonTestCount": len(nontest),
 				"test": pythonCapRefs(test), "nonTest": pythonCapRefs(nontest),
@@ -515,17 +518,17 @@ func (p *pythonProvider) SimulateEdit(ctx context.Context, src WorkflowSource, p
 		}
 	}()
 	after := before
-	degraded := ""
+	changed := false
 	deadline := time.Now().Add(pythonSimulateBudget)
 	for {
 		if d, ok := src.Diagnostics(ctx, path); ok {
 			after = d
 			if pythonDiagSig(d) != beforeSig {
+				changed = true
 				break
 			}
 		}
 		if time.Now().After(deadline) {
-			degraded = "诊断在预算内无变化 (服务器未推送或改动无新诊断), diff 可能为空"
 			break
 		}
 		select {
@@ -538,11 +541,21 @@ func (p *pythonProvider) SimulateEdit(ctx context.Context, src WorkflowSource, p
 		return nil, fmt.Errorf("恢复磁盘内容失败: %w", err)
 	}
 	restored = true
+	introduced, resolved := pythonDiagDiff(before, after)
 	out["before"] = map[string]any{"count": before["count"], "items": pythonDiagItems(before, 20)}
 	out["after"] = map[string]any{"count": after["count"], "items": pythonDiagItems(after, 20)}
+	out["errors_introduced"] = introduced
+	out["errors_resolved"] = resolved
+	out["net_delta"] = len(introduced) - len(resolved)
 	out["restored"] = true
-	if degraded != "" {
-		out["note"] = degraded
+	// 置信度 (参照 agent-lsp preview_edit: 观测到新推送=high, 否则 low+原因)。
+	// net_delta<=0 且 high → 可安全应用; 其他情况人工复核。
+	if changed {
+		out["confidence"] = "high"
+		out["confidenceReason"] = "预览后观测到诊断推送变化"
+	} else {
+		out["confidence"] = "low"
+		out["confidenceReason"] = "预算内诊断无变化 (服务器未推送或改动无新诊断)，结论仅供参考"
 	}
 	return out, nil
 }
@@ -606,3 +619,54 @@ func pythonApplyEdits(orig string, edits []TextEdit) (string, error) {
 
 // 编译期断言: go provider 满足 workflow 契约。
 var _ Workflows = (*pythonProvider)(nil)
+
+// pythonSortRefs 引用排序: 同目录优先 → 路径浅优先 → 服务器原始顺序保持
+// (截断时保重要引用, 非返回顺序)。
+func pythonSortRefs(queryPath string, in []map[string]any) {
+	qd := filepath.Dir(queryPath)
+	sort.SliceStable(in, func(a, b int) bool {
+		pa, _ := in[a]["path"].(string)
+		pb, _ := in[b]["path"].(string)
+		sa := filepath.Dir(pa) == qd
+		sb := filepath.Dir(pb) == qd
+		if sa != sb {
+			return sa
+		}
+		da := strings.Count(pa, string(filepath.Separator))
+		db := strings.Count(pb, string(filepath.Separator))
+		return da < db
+	})
+}
+
+// pythonDiagDiff 诊断差集 (before→after): introduced=新增消息, resolved=消除消息 (按 message 多重集差分)。
+func pythonDiagDiff(before, after map[string]any) (introduced, resolved []string) {
+	counts := func(diag map[string]any) map[string]int {
+		set := map[string]int{}
+		if diag == nil {
+			return set
+		}
+		raw, _ := diag["diagnostics"].([]any)
+		for _, it := range raw {
+			m, _ := it.(map[string]any)
+			if m == nil {
+				continue
+			}
+			msg, _ := m["message"].(string)
+			set[msg]++
+		}
+		return set
+	}
+	b, a := counts(before), counts(after)
+	introduced, resolved = []string{}, []string{}
+	for msg, n := range a {
+		for i := b[msg]; i < n; i++ {
+			introduced = append(introduced, msg)
+		}
+	}
+	for msg, n := range b {
+		for i := a[msg]; i < n; i++ {
+			resolved = append(resolved, msg)
+		}
+	}
+	return introduced, resolved
+}

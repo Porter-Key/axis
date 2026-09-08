@@ -150,6 +150,9 @@ func (p *Plugin) svcForCtx(ctx context.Context) (*Service, error) {
 	}
 	proj, ok := p.gate.ProjectFor(ctx)
 	if !ok {
+		if h := p.gate.RecoveryHint(); h != "" {
+			return nil, fmt.Errorf("%w。%s", ErrNotActivated, h)
+		}
 		return nil, ErrNotActivated
 	}
 	return p.svcFor(proj)

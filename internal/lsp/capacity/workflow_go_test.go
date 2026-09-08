@@ -3,6 +3,7 @@ package lsp_capacity
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -69,6 +70,87 @@ func TestGoApplyEdits(t *testing.T) {
 		{StartLine: 0, StartChar: 3, EndLine: 0, EndChar: 5},
 	}); err == nil {
 		t.Error("重叠应报错")
+	}
+}
+
+func TestGoSortRefs(t *testing.T) {
+	in := []map[string]any{
+		{"path": "/a/z/deep/x.go"},
+		{"path": "/a/y.go"},
+		{"path": "/a/z/w.go"},
+		{"path": "/a/q.go"},
+	}
+	goSortRefs("/a/q.go", in)
+	// 同目录 (/a) 优先且保持原始相对顺序, 深路径沉底
+	want := []string{"/a/y.go", "/a/q.go", "/a/z/w.go", "/a/z/deep/x.go"}
+	for i, w := range want {
+		if in[i]["path"] != w {
+			t.Fatalf("order[%d]=%v want %q (full %+v)", i, in[i]["path"], w, in)
+		}
+	}
+}
+
+func TestGoDiagDiff(t *testing.T) {
+	mk := func(msgs ...string) map[string]any {
+		raw := []any{}
+		for _, m := range msgs {
+			raw = append(raw, map[string]any{"message": m, "severity": 1})
+		}
+		return map[string]any{"count": len(raw), "diagnostics": raw}
+	}
+	// nil 安全
+	if intr, reso := goDiagDiff(nil, nil); len(intr) != 0 || len(reso) != 0 {
+		t.Fatalf("nil 差集应为空: intr=%v reso=%v", intr, reso)
+	}
+	// 多重集差分: before=[A A B] after=[A C] → introduced=[C] resolved=[A B]
+	intr, reso := goDiagDiff(mk("A", "A", "B"), mk("A", "C"))
+	if len(intr) != 1 || intr[0] != "C" {
+		t.Fatalf("introduced 错误: %v", intr)
+	}
+	if len(reso) != 2 {
+		t.Fatalf("resolved 错误: %v", reso)
+	}
+	seen := map[string]int{}
+	for _, m := range reso {
+		seen[m]++
+	}
+	if seen["A"] != 1 || seen["B"] != 1 {
+		t.Fatalf("resolved 多重集错误: %v", reso)
+	}
+}
+
+// TestVerifyChainHints 全语言 hint 可执行断言: buildHint/testHint 非空且以预期可执行命令开头
+// (回归 43ae1f3 前 go testHint 曾为不可执行的绝对路径+`/...` 拼接)。
+func TestVerifyChainHints(t *testing.T) {
+	src := &mockWorkflowSrc{
+		diag: map[string]any{"count": 0, "diagnostics": []any{}}, diagOK: true}
+	cases := []struct {
+		name     string
+		p        Workflows
+		path     string
+		buildPre string
+		testPre  string
+	}{
+		{"go", &goProvider{}, "/a/x.go", "go build", "go test"},
+		{"rust", &rustProvider{}, "/a/src/main.rs", "cargo check", "cargo test"},
+		{"python", &pythonProvider{}, "/a/pkg/mod.py", "python -m py_compile", "pytest"},
+		{"typescript", &typescriptProvider{}, "/a/src/x.ts", "npx tsc", "npm test"},
+		{"javascript", &javascriptProvider{}, "/a/src/x.js", "node --check", "npm test"},
+		{"csharp", &csharpProvider{}, "/a/Proj/Foo.cs", "dotnet build", "dotnet test"},
+	}
+	for _, c := range cases {
+		out, err := c.p.VerifyChain(context.Background(), src, c.path)
+		if err != nil {
+			t.Fatalf("%s VerifyChain 失败: %v", c.name, err)
+		}
+		bh, _ := out["buildHint"].(string)
+		th, _ := out["testHint"].(string)
+		if !strings.HasPrefix(bh, c.buildPre) {
+			t.Errorf("%s buildHint 不可执行: %q want prefix %q", c.name, bh, c.buildPre)
+		}
+		if !strings.HasPrefix(th, c.testPre) {
+			t.Errorf("%s testHint 不可执行: %q want prefix %q", c.name, th, c.testPre)
+		}
 	}
 }
 

@@ -20,7 +20,7 @@ func (l *LSP) workflowPrep(ctx context.Context, args map[string]any) (lang strin
 		return "", nil, nil, mcpkit.ErrRes("path 必须为绝对路径: " + mcpkit.ArgStr(args, "path"))
 	}
 	if _, ok := l.requireProject(ctx, path); !ok {
-		return "", nil, nil, mcpkit.ErrRes("未激活项目或文件不在激活项目内: 请先 axis_activate(project)")
+		return "", nil, nil, mcpkit.ErrRes(l.notActivated())
 	}
 	root, ok := l.ensureProject(ctx, path)
 	if !ok {

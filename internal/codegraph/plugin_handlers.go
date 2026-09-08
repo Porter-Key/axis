@@ -24,6 +24,11 @@ func (p *Plugin) requireRoot(ctx context.Context, root string) bool {
 	return filepath.Clean(proj) == filepath.Clean(root)
 }
 
+// notActivated 未激活拒绝消息 (附 Gate 恢复提示)。
+func (p *Plugin) notActivated() string {
+	return p.gate.RejectMsg("root 与激活项目不符或未激活: 请先 axis_activate(project)")
+}
+
 // handleExplore explore_code: 粗探索 (任务描述 → 相关符号+调用路径)。
 func (p *Plugin) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
@@ -32,7 +37,7 @@ func (p *Plugin) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcpkit.ErrRes("root 必须为绝对路径: " + mcpkit.ArgStr(args, "root")), nil
 	}
 	if !p.requireRoot(ctx, root) {
-		return mcpkit.ErrRes("root 与激活项目不符或未激活: 请先 axis_activate(project)"), nil
+		return mcpkit.ErrRes(p.notActivated()), nil
 	}
 	q, _ := args["query"].(string)
 	if q == "" {
@@ -57,7 +62,7 @@ func (p *Plugin) handleJSON(kind string) server.ToolHandlerFunc {
 			return mcpkit.ErrRes("root 必须为绝对路径: " + mcpkit.ArgStr(args, "root")), nil
 		}
 		if !p.requireRoot(ctx, root) {
-			return mcpkit.ErrRes("root 与激活项目不符或未激活: 请先 axis_activate(project)"), nil
+			return mcpkit.ErrRes(p.notActivated()), nil
 		}
 		if err := p.cg.Load().EnsureIndex(root); err != nil {
 			return mcpkit.ErrRes(err.Error()), nil
@@ -99,7 +104,7 @@ func (p *Plugin) handleText(cmd string) server.ToolHandlerFunc {
 			return mcpkit.ErrRes("root 必须为绝对路径: " + mcpkit.ArgStr(args, "root")), nil
 		}
 		if !p.requireRoot(ctx, root) {
-			return mcpkit.ErrRes("root 与激活项目不符或未激活: 请先 axis_activate(project)"), nil
+			return mcpkit.ErrRes(p.notActivated()), nil
 		}
 		if err := p.cg.Load().EnsureIndex(root); err != nil {
 			return mcpkit.ErrRes(err.Error()), nil

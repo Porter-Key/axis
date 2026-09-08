@@ -33,7 +33,7 @@ func (l *LSP) handleDefinition(ctx context.Context, req mcp.CallToolRequest) (*m
 		scope = "definition"
 	}
 	if _, ok := l.requireProject(ctx, path); !ok {
-		return mcpkit.ErrRes("未激活项目或文件不在激活项目内: 请先 axis_activate(project)"), nil
+		return mcpkit.ErrRes(l.notActivated()), nil
 	}
 	root, ok := l.ensureProject(ctx, path)
 	if !ok {
@@ -92,7 +92,7 @@ func (l *LSP) handleLSPRequest(lspMethod string) server.ToolHandlerFunc {
 		line, _ := args["line"].(float64)
 		ch, _ := args["character"].(float64)
 		if _, ok := l.requireProject(ctx, path); !ok {
-			return mcpkit.ErrRes("未激活项目或文件不在激活项目内: 请先 axis_activate(project)"), nil
+			return mcpkit.ErrRes(l.notActivated()), nil
 		}
 		root, ok := l.ensureProject(ctx, path)
 		if !ok {
@@ -135,7 +135,7 @@ func (l *LSP) handleDiagnostics(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcpkit.ErrRes("path 必须为绝对路径: " + mcpkit.ArgStr(args, "path")), nil
 	}
 	if _, ok := l.requireProject(ctx, path); !ok {
-		return mcpkit.ErrRes("未激活项目或文件不在激活项目内: 请先 axis_activate(project)"), nil
+		return mcpkit.ErrRes(l.notActivated()), nil
 	}
 	root, ok := l.ensureProject(ctx, path)
 	if !ok {
@@ -199,7 +199,7 @@ func (l *LSP) handleRename(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	ch, _ := args["character"].(float64)
 	newName, _ := args["newName"].(string)
 	if _, ok := l.requireProject(ctx, path); !ok {
-		return mcpkit.ErrRes("未激活项目或文件不在激活项目内: 请先 axis_activate(project)"), nil
+		return mcpkit.ErrRes(l.notActivated()), nil
 	}
 	root, ok := l.ensureProject(ctx, path)
 	if !ok {
@@ -228,13 +228,13 @@ func (l *LSP) handleSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 	query, _ := args["query"].(string)
 	if _, ok := l.requireProject(ctx, path); !ok {
-		return mcpkit.ErrRes("未激活项目或文件不在激活项目内: 请先 axis_activate(project)"), nil
+		return mcpkit.ErrRes(l.notActivated()), nil
 	}
 	// 目录 → workspace/symbol; 文件 → documentSymbol
 	if st, err := os.Stat(path); err == nil && st.IsDir() {
 		proj, ok := l.requireProject(ctx, path)
 		if !ok {
-			return mcpkit.ErrRes("未激活项目或文件不在激活项目内: 请先 axis_activate(project)"), nil
+			return mcpkit.ErrRes(l.notActivated()), nil
 		}
 		// 按项目根 (而非子目录本身) 找已有连接: 连接 key 是项目根|lang,
 		// 拿子目录查池永远 miss (旧 bug)。
@@ -275,6 +275,11 @@ func (l *LSP) handleSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 }
 
 // ---------- 项目/监控辅助 ----------
+
+// notActivated 未激活拒绝消息 (附 Gate 恢复提示: 上次项目一调即回)。
+func (l *LSP) notActivated() string {
+	return l.gate.RejectMsg("未激活项目或文件不在激活项目内: 请先 axis_activate(project)")
+}
 
 // requireProject 门禁: 从 ctx 取激活项目, 校验 path 属于激活项目内。
 // 未激活 → err; path 在项目外 → err (严格绑定: 不能跨项目操作)。
